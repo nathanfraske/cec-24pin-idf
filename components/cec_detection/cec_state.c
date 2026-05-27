@@ -5,10 +5,11 @@
 #include <stdbool.h>
 #include "cec_state.h"
 
-/* v0.5.9 thresholds: voltage-based for OFF/STANDBY, power-based for
- * IDLE/ACTIVE/PEAK with hysteresis on the upper transitions. */
-#define V_OFF_BELOW           1.0f
-#define V_STANDBY_BELOW       10.5f
+/* Thresholds. OFF/STANDBY split uses 5VSB and 12V respectively so the
+ * "unplugged" state is distinguishable from "plugged but main rails off".
+ * IDLE/ACTIVE/PEAK transitions are power-based with hysteresis (v0.5.9). */
+#define V_5VSB_PRESENT_ABOVE  1.0f
+#define V_12V_UP_ABOVE        10.5f
 #define P_IDLE_TO_ACTIVE_IN   40.0f
 #define P_IDLE_TO_ACTIVE_OUT  32.0f
 #define P_ACTIVE_TO_PEAK_IN   150.0f
@@ -28,10 +29,11 @@ const char *cec_state_name(cec_state_t s)
     return NAMES[s];
 }
 
-cec_state_t cec_state_classify(float v_12v, float p_total, cec_state_t current)
+cec_state_t cec_state_classify(float v_12v, float v_5vsb, float p_total,
+                               cec_state_t current)
 {
-    if (v_12v < V_OFF_BELOW)     return CEC_STATE_OFF;
-    if (v_12v < V_STANDBY_BELOW) return CEC_STATE_STANDBY;
+    if (v_5vsb < V_5VSB_PRESENT_ABOVE) return CEC_STATE_OFF;
+    if (v_12v  < V_12V_UP_ABOVE)       return CEC_STATE_STANDBY;
 
     bool was_active = (current == CEC_STATE_ACTIVE || current == CEC_STATE_PEAK);
     bool was_peak   = (current == CEC_STATE_PEAK);

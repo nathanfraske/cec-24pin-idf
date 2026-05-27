@@ -134,7 +134,7 @@ static const acs712_t s_acs_3v3 = {
 };
 
 /* Filter state */
-static ema_t s_i_5vsb_ema;
+static ema_t s_v_5vsb_ema, s_i_5vsb_ema;
 static ema_t s_v_12v_ema, s_v_5v_ema, s_v_3v3_ema;
 static ema_t s_i_12v_ema, s_i_5v_ema, s_i_3v3_ema;
 static ema_t s_temp_ema;
@@ -269,6 +269,7 @@ void app_main(void)
         ESP_LOGW(TAG, "Continuing without ADC rail readings");
     }
 
+    ema_init(&s_v_5vsb_ema, EMA_ALPHA_FAST);
     ema_init(&s_i_5vsb_ema, EMA_ALPHA_FAST);
     ema_init(&s_v_12v_ema,  EMA_ALPHA_FAST);
     ema_init(&s_v_5v_ema,   EMA_ALPHA_FAST);
@@ -310,6 +311,7 @@ void app_main(void)
         /* On a failed read, fall back to the last good filtered value so a
          * single bad sample doesn't ripple into the state classifier. Before
          * the first successful read an EMA returns 0.0 (its init value). */
+        float v_5vsb_ema = ok_5vsb  ? ema_update(&s_v_5vsb_ema, v_5vsb) : ema_value(&s_v_5vsb_ema);
         float i_5vsb_ema = ok_5vsb  ? ema_update(&s_i_5vsb_ema, i_5vsb) : ema_value(&s_i_5vsb_ema);
         float v_12v_ema  = ok_v_12v ? ema_update(&s_v_12v_ema,  v_12v)  : ema_value(&s_v_12v_ema);
         float v_5v_ema   = ok_v_5v  ? ema_update(&s_v_5v_ema,   v_5v)   : ema_value(&s_v_5v_ema);
@@ -325,7 +327,7 @@ void app_main(void)
                       + (v_5v_ema  * i_5v_ema)
                       + (v_3v3_ema * i_3v3_ema);
 
-        cec_state_t next_state = cec_state_classify(v_12v_ema, p_total, s_state);
+        cec_state_t next_state = cec_state_classify(v_12v_ema, v_5vsb_ema, p_total, s_state);
         if (next_state != s_state) {
             int64_t now_us = esp_timer_get_time();
             int64_t dwell_ms = (now_us - s_state_entered_us) / 1000;
@@ -355,11 +357,12 @@ void app_main(void)
             cec_layer1_reset(&s_l1_5v);  s_last_sev_5v  = CEC_SEV_NONE;
             cec_layer1_reset(&s_l1_3v3); s_last_sev_3v3 = CEC_SEV_NONE;
         }
-        cec_severity_t sev_5vsb = layer1_step("5VSB", &s_l1_5vsb, &s_last_sev_5vsb, v_5vsb);
+        cec_severity_t sev_5vsb = layer1_step("5VSB", &s_l1_5vsb, &s_last_sev_5vsb, v_5vsb_ema);
 
         if (iter % TELEPLOT_DIVIDER == 0) {
             if (ok_5vsb) {
                 teleplot_emit("v_5vsb",     v_5vsb);
+                teleplot_emit("v_5vsb_ema", v_5vsb_ema);
                 teleplot_emit("i_5vsb_raw", i_5vsb);
                 teleplot_emit("i_5vsb_ema", i_5vsb_ema);
             }
@@ -383,7 +386,7 @@ void app_main(void)
                           "I: 12=%.2f 5=%.2f 3V3=%.2f 5SB=%.4f | "
                           "P=%.1fW T=%.1fC",
                      cec_state_name(s_state),
-                     v_12v_ema, v_5v_ema, v_3v3_ema, v_5vsb,
+                     v_12v_ema, v_5v_ema, v_3v3_ema, v_5vsb_ema,
                      i_12v_ema, i_5v_ema, i_3v3_ema, i_5vsb_ema,
                      p_total, temp_ema);
         }
