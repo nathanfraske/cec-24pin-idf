@@ -73,10 +73,13 @@ static const char *TAG = "cec_main";
  * at these sensitivities), so each rail gets its own constant for hand-
  * tuning. The boot-time diagnostic logs the measured no-load output —
  * with the PSU disconnected at first boot, copy those values here. Full
- * runtime calibration lands with the serial-command + NVS path. */
-#define ACS712_ZERO_12V      2.20f
-#define ACS712_ZERO_5V       2.20f
-#define ACS712_ZERO_3V3      2.20f
+ * runtime calibration lands with the serial-command + NVS path.
+ *
+ * Values below are the per-unit no-load measurements captured against
+ * this board with the PSU disconnected. */
+#define ACS712_ZERO_12V      2.4483f
+#define ACS712_ZERO_5V       2.1967f
+#define ACS712_ZERO_3V3      2.2117f
 
 /* Loop cadence. Sample at 50 Hz to match v0.5.9; emit TelePlot at 10 Hz
  * (every 5th iteration); log an INFO summary at 1 Hz (every 50th). */
