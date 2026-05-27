@@ -30,6 +30,7 @@
 #include "thermistor.h"
 #include "acs712.h"
 #include "cec_filters.h"
+#include "cec_state.h"
 #include "cec_teleplot.h"
 
 static const char *TAG = "cec_main";
@@ -136,6 +137,10 @@ static ema_t s_i_5vsb_ema;
 static ema_t s_v_12v_ema, s_v_5v_ema, s_v_3v3_ema;
 static ema_t s_i_12v_ema, s_i_5v_ema, s_i_3v3_ema;
 static ema_t s_temp_ema;
+
+/* State machine */
+static cec_state_t s_state = CEC_STATE_OFF;
+static int64_t s_state_entered_us = 0;
 
 static void init_i2c_bus(void)
 {
@@ -257,14 +262,34 @@ void app_main(void)
         ok_i_3v3 = (acs712_read_amps(&s_acs_3v3, &i_3v3) == ESP_OK);
         ok_temp  = (thermistor_read_celsius(&s_ntc, &temp_c) == ESP_OK);
 
-        float i_5vsb_ema = ok_5vsb  ? ema_update(&s_i_5vsb_ema, i_5vsb) : 0.0f;
-        float v_12v_ema  = ok_v_12v ? ema_update(&s_v_12v_ema,  v_12v)  : 0.0f;
-        float v_5v_ema   = ok_v_5v  ? ema_update(&s_v_5v_ema,   v_5v)   : 0.0f;
-        float v_3v3_ema  = ok_v_3v3 ? ema_update(&s_v_3v3_ema,  v_3v3)  : 0.0f;
-        float i_12v_ema  = ok_i_12v ? ema_update(&s_i_12v_ema,  i_12v)  : 0.0f;
-        float i_5v_ema   = ok_i_5v  ? ema_update(&s_i_5v_ema,   i_5v)   : 0.0f;
-        float i_3v3_ema  = ok_i_3v3 ? ema_update(&s_i_3v3_ema,  i_3v3)  : 0.0f;
-        float temp_ema   = ok_temp  ? ema_update(&s_temp_ema,   temp_c) : 0.0f;
+        /* On a failed read, fall back to the last good filtered value so a
+         * single bad sample doesn't ripple into the state classifier. Before
+         * the first successful read an EMA returns 0.0 (its init value). */
+        float i_5vsb_ema = ok_5vsb  ? ema_update(&s_i_5vsb_ema, i_5vsb) : ema_value(&s_i_5vsb_ema);
+        float v_12v_ema  = ok_v_12v ? ema_update(&s_v_12v_ema,  v_12v)  : ema_value(&s_v_12v_ema);
+        float v_5v_ema   = ok_v_5v  ? ema_update(&s_v_5v_ema,   v_5v)   : ema_value(&s_v_5v_ema);
+        float v_3v3_ema  = ok_v_3v3 ? ema_update(&s_v_3v3_ema,  v_3v3)  : ema_value(&s_v_3v3_ema);
+        float i_12v_ema  = ok_i_12v ? ema_update(&s_i_12v_ema,  i_12v)  : ema_value(&s_i_12v_ema);
+        float i_5v_ema   = ok_i_5v  ? ema_update(&s_i_5v_ema,   i_5v)   : ema_value(&s_i_5v_ema);
+        float i_3v3_ema  = ok_i_3v3 ? ema_update(&s_i_3v3_ema,  i_3v3)  : ema_value(&s_i_3v3_ema);
+        float temp_ema   = ok_temp  ? ema_update(&s_temp_ema,   temp_c) : ema_value(&s_temp_ema);
+
+        /* Total main-rail power, EMA-smoothed. 5VSB is standby and not
+         * included by design (matches v0.5.9). */
+        float p_total = (v_12v_ema * i_12v_ema)
+                      + (v_5v_ema  * i_5v_ema)
+                      + (v_3v3_ema * i_3v3_ema);
+
+        cec_state_t next_state = cec_state_classify(v_12v_ema, p_total, s_state);
+        if (next_state != s_state) {
+            int64_t now_us = esp_timer_get_time();
+            int64_t dwell_ms = (now_us - s_state_entered_us) / 1000;
+            ESP_LOGI(TAG, "state: %s -> %s (dwell=%lld ms, p_total=%.1f W)",
+                     cec_state_name(s_state), cec_state_name(next_state),
+                     (long long)dwell_ms, p_total);
+            s_state = next_state;
+            s_state_entered_us = now_us;
+        }
 
         if (iter % TELEPLOT_DIVIDER == 0) {
             if (ok_5vsb) {
@@ -279,13 +304,18 @@ void app_main(void)
             if (ok_i_5v)  { teleplot_emit("i_5v",  i_5v);  teleplot_emit("i_5v_ema",  i_5v_ema);  }
             if (ok_i_3v3) { teleplot_emit("i_3v3", i_3v3); teleplot_emit("i_3v3_ema", i_3v3_ema); }
             if (ok_temp)  { teleplot_emit("temp_c", temp_c); teleplot_emit("temp_c_ema", temp_ema); }
+            teleplot_emit("p_total", p_total);
+            teleplot_emit("state",   (float)s_state);
         }
 
         if (iter % LOG_DIVIDER == 0) {
-            ESP_LOGI(TAG, "V: 12=%.3f 5=%.3f 3V3=%.3f 5SB=%.3f | "
-                          "I: 12=%.2f 5=%.2f 3V3=%.2f 5SB=%.4f | T=%.1f C",
+            ESP_LOGI(TAG, "[%s] V: 12=%.3f 5=%.3f 3V3=%.3f 5SB=%.3f | "
+                          "I: 12=%.2f 5=%.2f 3V3=%.2f 5SB=%.4f | "
+                          "P=%.1fW T=%.1fC",
+                     cec_state_name(s_state),
                      v_12v_ema, v_5v_ema, v_3v3_ema, v_5vsb,
-                     i_12v_ema, i_5v_ema, i_3v3_ema, i_5vsb_ema, temp_ema);
+                     i_12v_ema, i_5v_ema, i_3v3_ema, i_5vsb_ema,
+                     p_total, temp_ema);
         }
 
         iter++;

@@ -56,7 +56,7 @@ Tracking the port progress from Arduino-ESP32 v0.5.9 to ESP-IDF:
 | Sample loop at 50 Hz | Done |
 | EMA / median filter primitives | Done |
 | Teleplot output via USB CDC | Done |
-| State classifier | Pending |
+| State classifier | Done |
 | Layer 1/2/3 detectors | Pending |
 | Burst capture engine | Pending |
 | NVS profile storage | Pending |
