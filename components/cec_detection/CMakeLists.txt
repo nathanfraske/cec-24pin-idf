@@ -3,10 +3,10 @@ idf_component_register(
         "cec_filters.c"
         "cec_state.c"
         "cec_layer1.c"
+        "cec_layer2.c"
+        "cec_layer3.c"
         # Source files added during porting:
         # "swing_detector.c"
-        # "adaptive_transient.c"
-        # "profile.c"
     INCLUDE_DIRS "include"
     REQUIRES nvs_flash
 )
