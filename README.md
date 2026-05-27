@@ -47,7 +47,7 @@ Tracking the port progress from Arduino-ESP32 v0.5.9 to ESP-IDF:
 | Component | Status |
 |---|---|
 | Project skeleton | Done |
-| Hello World boot | Pending hardware test |
+| Hello World boot | Done (validated on prototype hardware) |
 | I2C master driver (for INA226) | Done |
 | ADC oneshot reads — rail voltages (12V/5V/3V3) | Done |
 | ADC oneshot reads — NTC temperature | Done |
