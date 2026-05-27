@@ -38,6 +38,7 @@
 #include "cec_swing.h"
 #include "cec_nvs.h"
 #include "cec_capture.h"
+#include "cec_cli.h"
 #include "cec_teleplot.h"
 
 static const char *TAG = "cec_main";
@@ -261,9 +262,26 @@ static float s_i_swing_3v3_buf[CURRENT_SWING_WINDOW_SIZE];
  * firmware revision reject an old blob cleanly if the layout changes. */
 #define NVS_PROFILES_KEY     "profiles"
 #define NVS_PROFILES_MAGIC   0xCEC30001U
+#define NVS_SETTINGS_KEY     "settings"
+#define NVS_SETTINGS_MAGIC   0xCEC50001U
 #define NVS_SAVE_INTERVAL_US (5LL * 60 * 1000 * 1000)   /* 5 minutes */
 static bool    s_profiles_dirty = false;
 static int64_t s_last_nvs_save_us = 0;
+
+/* Runtime-toggleable layer enables, persisted to NVS so they survive
+ * reboots. Defaults are all-on. Toggle via the serial CLI. */
+typedef struct {
+    bool layer1;
+    bool layer2;
+    bool layer3;
+    bool swing_power;
+    bool swing_current;
+} cec_settings_t;
+static cec_settings_t s_settings = {
+    .layer1 = true, .layer2 = true, .layer3 = true,
+    .swing_power = true, .swing_current = true,
+};
+static bool s_settings_dirty = false;
 
 static void init_i2c_bus(void)
 {
@@ -396,6 +414,37 @@ static void load_profiles_from_nvs(void)
     }
 }
 
+static void load_settings_from_nvs(void)
+{
+    cec_settings_t loaded;
+    esp_err_t err = cec_nvs_load_blob(NVS_SETTINGS_KEY, NVS_SETTINGS_MAGIC,
+                                      &loaded, sizeof(loaded));
+    if (err == ESP_OK) {
+        s_settings = loaded;
+        ESP_LOGI(TAG, "NVS: loaded settings (L1=%d L2=%d L3=%d sp=%d sc=%d)",
+                 s_settings.layer1, s_settings.layer2, s_settings.layer3,
+                 s_settings.swing_power, s_settings.swing_current);
+    } else if (err == ESP_ERR_NOT_FOUND) {
+        ESP_LOGI(TAG, "NVS: no saved settings, using defaults (all-on)");
+    } else if (err == ESP_ERR_INVALID_VERSION || err == ESP_ERR_INVALID_SIZE) {
+        ESP_LOGW(TAG, "NVS: stored settings unusable (%s), clearing",
+                 esp_err_to_name(err));
+        cec_nvs_clear_blob(NVS_SETTINGS_KEY);
+    }
+}
+
+static void save_settings_to_nvs(void)
+{
+    esp_err_t err = cec_nvs_save_blob(NVS_SETTINGS_KEY, NVS_SETTINGS_MAGIC,
+                                      &s_settings, sizeof(s_settings));
+    if (err == ESP_OK) {
+        s_settings_dirty = false;
+        ESP_LOGI(TAG, "NVS: saved settings");
+    } else {
+        ESP_LOGW(TAG, "NVS: settings save failed: %s", esp_err_to_name(err));
+    }
+}
+
 /* Re-prime EMAs to the next sample on transitions UP into the
  * main-rails-on regime. Without this, the EMAs would carry their
  * pre-transition (near-zero) values into the new state and produce
@@ -488,6 +537,151 @@ static void hs_sample_fn(cec_capture_hs_sample_t *out)
     acs712_read_amps(&s_hs_acs_3v3, &out->i_3v3);
 }
 
+/* ---------------------------- CLI handlers ---------------------------- */
+
+/* Trigger a manual burst with optional caller-supplied annotation text.
+ * Tokens argv[1..argc-1] are space-joined into a single annotation. If
+ * no text is supplied the burst still fires with reason=MANUAL but
+ * without an annotation line. */
+static int cli_cmd_burst(int argc, char **argv)
+{
+    char text[96];
+    text[0] = '\0';
+    if (argc >= 2) {
+        size_t pos = 0;
+        for (int i = 1; i < argc; i++) {
+            size_t avail = sizeof(text) - pos - 1;
+            if (avail == 0) break;
+            if (i > 1) { text[pos++] = ' '; if (pos >= sizeof(text) - 1) break; avail--; }
+            size_t n = strlen(argv[i]);
+            if (n > avail) n = avail;
+            memcpy(text + pos, argv[i], n);
+            pos += n;
+            text[pos] = '\0';
+        }
+    }
+    esp_err_t err = cec_capture_trigger_with_text(CEC_TRIG_MANUAL,
+                                                   text[0] ? text : NULL);
+    if (err == ESP_OK) {
+        printf("burst triggered (manual%s%s)\n",
+               text[0] ? ", annotation: " : "",
+               text[0] ? text : "");
+        return 0;
+    }
+    if (err == ESP_ERR_NOT_FINISHED) {
+        printf("error: capture already running\n");
+    } else if (err == ESP_ERR_INVALID_STATE) {
+        printf("error: within cooldown window\n");
+    } else {
+        printf("error: %s\n", esp_err_to_name(err));
+    }
+    return 1;
+}
+
+static bool *settings_flag_for(const char *name)
+{
+    if (strcmp(name, "layer1") == 0 || strcmp(name, "l1") == 0)
+        return &s_settings.layer1;
+    if (strcmp(name, "layer2") == 0 || strcmp(name, "l2") == 0)
+        return &s_settings.layer2;
+    if (strcmp(name, "layer3") == 0 || strcmp(name, "l3") == 0)
+        return &s_settings.layer3;
+    if (strcmp(name, "swing_power") == 0 || strcmp(name, "sp") == 0)
+        return &s_settings.swing_power;
+    if (strcmp(name, "swing_current") == 0 || strcmp(name, "sc") == 0)
+        return &s_settings.swing_current;
+    return NULL;
+}
+
+static int cli_cmd_set(int argc, char **argv)
+{
+    if (argc != 3) {
+        printf("usage: set <layer1|layer2|layer3|swing_power|swing_current> <on|off>\n");
+        return 1;
+    }
+    bool *flag = settings_flag_for(argv[1]);
+    if (flag == NULL) {
+        printf("error: unknown setting '%s'\n", argv[1]);
+        return 1;
+    }
+    bool new_value;
+    if (strcmp(argv[2], "on") == 0 || strcmp(argv[2], "1") == 0)        new_value = true;
+    else if (strcmp(argv[2], "off") == 0 || strcmp(argv[2], "0") == 0)  new_value = false;
+    else {
+        printf("error: value must be 'on' or 'off'\n");
+        return 1;
+    }
+    *flag = new_value;
+    s_settings_dirty = true;
+    save_settings_to_nvs();
+    printf("%s = %s\n", argv[1], new_value ? "on" : "off");
+    return 0;
+}
+
+static int cli_cmd_status(int argc, char **argv)
+{
+    bool json = (argc >= 2 && strcmp(argv[1], "json") == 0);
+    int64_t now_us = esp_timer_get_time();
+    int64_t dwell_ms = (now_us - s_state_entered_us) / 1000;
+
+    if (json) {
+        printf("{\"state\":\"%s\",\"dwell_ms\":%lld,",
+               cec_state_name(s_state), (long long)dwell_ms);
+        printf("\"v\":{\"12v\":%.3f,\"5v\":%.3f,\"3v3\":%.3f,\"5vsb\":%.3f},",
+               ema_value(&s_v_12v_ema), ema_value(&s_v_5v_ema),
+               ema_value(&s_v_3v3_ema), ema_value(&s_v_5vsb_ema));
+        printf("\"i\":{\"12v\":%.3f,\"5v\":%.3f,\"3v3\":%.3f,\"5vsb\":%.4f},",
+               ema_value(&s_i_12v_ema), ema_value(&s_i_5v_ema),
+               ema_value(&s_i_3v3_ema), ema_value(&s_i_5vsb_ema));
+        printf("\"temp_c\":%.2f,", ema_value(&s_temp_ema));
+        printf("\"layers\":{\"l1\":%s,\"l2\":%s,\"l3\":%s,\"swing_power\":%s,\"swing_current\":%s},",
+               s_settings.layer1 ? "true" : "false",
+               s_settings.layer2 ? "true" : "false",
+               s_settings.layer3 ? "true" : "false",
+               s_settings.swing_power ? "true" : "false",
+               s_settings.swing_current ? "true" : "false");
+        printf("\"profile_warm\":{");
+        for (int s = 0; s < CEC_STATE_COUNT; s++) {
+            printf("%s\"%s\":%s",
+                   s > 0 ? "," : "",
+                   cec_state_name((cec_state_t)s),
+                   cec_rail_profile_is_warm(&s_profiles[s][PROF_V_12V]) ? "true" : "false");
+        }
+        printf("},\"nvs\":{\"profiles_dirty\":%s}}\n",
+               s_profiles_dirty ? "true" : "false");
+        return 0;
+    }
+
+    printf("state:    %s  (dwell %lld ms)\n", cec_state_name(s_state), (long long)dwell_ms);
+    printf("V:        12=%.3f  5=%.3f  3V3=%.3f  5SB=%.3f\n",
+           ema_value(&s_v_12v_ema), ema_value(&s_v_5v_ema),
+           ema_value(&s_v_3v3_ema), ema_value(&s_v_5vsb_ema));
+    printf("I:        12=%.3f  5=%.3f  3V3=%.3f  5SB=%.4f\n",
+           ema_value(&s_i_12v_ema), ema_value(&s_i_5v_ema),
+           ema_value(&s_i_3v3_ema), ema_value(&s_i_5vsb_ema));
+    printf("temp:     %.2f C\n", ema_value(&s_temp_ema));
+    printf("layers:   L1=%s L2=%s L3=%s  swing/power=%s  swing/current=%s\n",
+           s_settings.layer1 ? "on" : "off",
+           s_settings.layer2 ? "on" : "off",
+           s_settings.layer3 ? "on" : "off",
+           s_settings.swing_power ? "on" : "off",
+           s_settings.swing_current ? "on" : "off");
+    printf("profiles: ");
+    for (int s = 0; s < CEC_STATE_COUNT; s++) {
+        printf("%s=%s  ", cec_state_name((cec_state_t)s),
+               cec_rail_profile_is_warm(&s_profiles[s][PROF_V_12V]) ? "warm" : "cold");
+    }
+    printf("\n");
+    printf("nvs:      profiles_dirty=%s\n", s_profiles_dirty ? "yes" : "no");
+    return 0;
+}
+
+static const cec_cli_command_t s_cli_commands[] = {
+    { "burst",  "burst now [reason text...] — fire a manual burst capture",  cli_cmd_burst  },
+    { "set",    "set <layer1|layer2|layer3|swing_power|swing_current> <on|off>", cli_cmd_set },
+    { "status", "status [json] — current state, EMA readings, layer enables, profile warmth", cli_cmd_status },
+};
+
 static void log_hardware_info(void)
 {
     esp_chip_info_t chip_info;
@@ -549,8 +743,16 @@ void app_main(void)
 
     if (cec_nvs_init() == ESP_OK) {
         load_profiles_from_nvs();
+        load_settings_from_nvs();
     } else {
         ESP_LOGW(TAG, "NVS init failed; profiles will not persist across boots");
+    }
+
+    esp_err_t cli_err = cec_cli_init(s_cli_commands,
+                                     sizeof(s_cli_commands) / sizeof(s_cli_commands[0]));
+    if (cli_err != ESP_OK) {
+        ESP_LOGW(TAG, "cec_cli_init failed: %s — serial commands unavailable",
+                 esp_err_to_name(cli_err));
     }
 
     log_acs712_zero_measurements();
@@ -645,6 +847,14 @@ void app_main(void)
         bool main_rails_armed = l1_settled
             && (s_state == CEC_STATE_IDLE || s_state == CEC_STATE_ACTIVE || s_state == CEC_STATE_PEAK);
         bool sb_rail_armed = l1_settled && (s_state != CEC_STATE_OFF);
+        /* "active" = state-armed AND runtime-enabled. The settings flag
+         * lets the operator silence a layer at runtime without rebuilding. */
+        bool l1_main_active = s_settings.layer1 && main_rails_armed;
+        bool l1_sb_active   = s_settings.layer1 && sb_rail_armed;
+        bool l2_active      = s_settings.layer2 && main_rails_armed;
+        bool l3_active      = s_settings.layer3 && main_rails_armed;
+        bool sp_active      = s_settings.swing_power   && main_rails_armed;
+        bool sc_active      = s_settings.swing_current && main_rails_armed;
 
         cec_severity_t sev_12v = CEC_SEV_NONE;
         cec_severity_t sev_5v  = CEC_SEV_NONE;
@@ -652,7 +862,7 @@ void app_main(void)
         cec_severity_t sev_5vsb = CEC_SEV_NONE;
         bool any_entered_crit = false;
 
-        if (main_rails_armed) {
+        if (l1_main_active) {
             layer1_step_result_t r;
             r = layer1_step("12V", &s_l1_12v, &s_last_sev_12v, v_12v_ema);
             sev_12v = r.sev; any_entered_crit |= r.entered_critical;
@@ -665,7 +875,7 @@ void app_main(void)
             cec_layer1_reset(&s_l1_5v);  s_last_sev_5v  = CEC_SEV_NONE;
             cec_layer1_reset(&s_l1_3v3); s_last_sev_3v3 = CEC_SEV_NONE;
         }
-        if (sb_rail_armed) {
+        if (l1_sb_active) {
             layer1_step_result_t r5sb = layer1_step("5VSB", &s_l1_5vsb, &s_last_sev_5vsb, v_5vsb_ema);
             sev_5vsb = r5sb.sev;
             any_entered_crit |= r5sb.entered_critical;
@@ -684,15 +894,11 @@ void app_main(void)
             }
         }
 
-        /* Layers 2 and 3 share the same gating as the Layer 1 main rails:
-         * only run when settled in IDLE/ACTIVE/PEAK. During OFF/STANDBY
-         * the main rails are zero and the comparisons aren't meaningful;
-         * the settle window covers EMA / variance-estimator convergence
-         * after a state-up transition. */
-        bool detection_armed = main_rails_armed;
-
+        /* Layers 2 and 3 share the rail-state gating with Layer 1's main
+         * rails, then layer with their own enable flag so the operator
+         * can silence either layer at runtime. */
         bool l2_fired = false;
-        if (detection_armed) {
+        if (l2_active) {
             l2_fired |= cec_layer2_update(&s_l2_v_12v,  v_12v,  v_12v_ema);
             l2_fired |= cec_layer2_update(&s_l2_v_5v,   v_5v,   v_5v_ema);
             l2_fired |= cec_layer2_update(&s_l2_v_3v3,  v_3v3,  v_3v3_ema);
@@ -717,7 +923,7 @@ void app_main(void)
          * gated on transition (z stayed below, now crossed above)
          * so a sustained anomaly doesn't spam the trigger path. */
         float z_max = 0.0f;
-        if (detection_armed) {
+        if (l3_active) {
             cec_rail_profile_t *prof = s_profiles[s_state];
             cec_rail_profile_update(&prof[PROF_V_12V],  v_12v_ema,  PROFILE_ADAPT_RATE);
             cec_rail_profile_update(&prof[PROF_V_5V],   v_5v_ema,   PROFILE_ADAPT_RATE);
@@ -755,7 +961,7 @@ void app_main(void)
         float p_window_mean = cec_swing_detector_mean(&s_power_swing);
         float p_swing_thresh = fmaxf(POWER_SWING_MIN_THRESHOLD_W,
                                      POWER_SWING_FRACTION * p_window_mean);
-        if (detection_armed) {
+        if (sp_active) {
             if (cec_swing_detector_update(&s_power_swing, p_total, p_swing_thresh)) {
                 ESP_LOGW(TAG, "POWER SWING: now=%.1f W, mean=%.1f W, swing=%+.1f W, thr=%.1f W",
                          p_total, p_window_mean, p_total - p_window_mean, p_swing_thresh);
@@ -772,7 +978,7 @@ void app_main(void)
         /* Per-rail current swing. Fire on the first rail to trip, with
          * 12V > 5V > 3V3 priority so the log message identifies one
          * specific cause. Re-baseline all three windows on fire. */
-        if (detection_armed) {
+        if (sc_active) {
             bool f12 = cec_swing_detector_update(&s_i_swing_12v, i_12v_ema, CURRENT_SWING_THRESH_I_12V);
             bool f5  = cec_swing_detector_update(&s_i_swing_5v,  i_5v_ema,  CURRENT_SWING_THRESH_I_5V);
             bool f3v3 = cec_swing_detector_update(&s_i_swing_3v3, i_3v3_ema, CURRENT_SWING_THRESH_I_3V3);

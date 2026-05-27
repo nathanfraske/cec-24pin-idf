@@ -100,6 +100,16 @@ void cec_capture_push(const cec_capture_sample_t *s);
 esp_err_t cec_capture_trigger(cec_trigger_t reason);
 
 /*
+ * Same as cec_capture_trigger but attaches a short caller-supplied
+ * annotation string to the dump. If non-NULL and non-empty, the
+ * annotation is emitted on its own line right after BURST_BEGIN as
+ *   >BURST_ANNOTATION:<text>
+ * so capture-analysis tooling can pick it up. Text is copied; caller
+ * owns the buffer.
+ */
+esp_err_t cec_capture_trigger_with_text(cec_trigger_t reason, const char *text);
+
+/*
  * True between the moment a trigger is accepted and the moment the
  * dump completes.
  */

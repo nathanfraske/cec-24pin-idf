@@ -44,6 +44,9 @@ static volatile cec_trigger_t s_pending_reason = CEC_TRIG_NONE;
 static volatile int64_t s_last_complete_us = 0;
 static volatile bool s_inited = false;
 
+#define ANNOTATION_MAX 96
+static char s_pending_annotation[ANNOTATION_MAX] = {0};
+
 static const char *TRIGGER_NAMES[CEC_TRIG_COUNT] = {
     [CEC_TRIG_NONE]          = "none",
     [CEC_TRIG_MANUAL]        = "manual",
@@ -77,7 +80,7 @@ bool cec_capture_is_busy(void)
     return s_busy;
 }
 
-esp_err_t cec_capture_trigger(cec_trigger_t reason)
+esp_err_t cec_capture_trigger_with_text(cec_trigger_t reason, const char *text)
 {
     if (!s_inited) return ESP_ERR_INVALID_STATE;
     if (s_busy)    return ESP_ERR_NOT_FINISHED;
@@ -91,8 +94,22 @@ esp_err_t cec_capture_trigger(cec_trigger_t reason)
 
     s_busy = true;
     s_pending_reason = reason;
+    if (text != NULL && text[0] != '\0') {
+        /* strncpy + explicit NUL — we own the buffer, so we don't care
+         * about strncpy's "no-NUL on truncate" quirk so long as the
+         * trailing byte is zeroed. */
+        strncpy(s_pending_annotation, text, ANNOTATION_MAX - 1);
+        s_pending_annotation[ANNOTATION_MAX - 1] = '\0';
+    } else {
+        s_pending_annotation[0] = '\0';
+    }
     xSemaphoreGive(s_trigger_sem);
     return ESP_OK;
+}
+
+esp_err_t cec_capture_trigger(cec_trigger_t reason)
+{
+    return cec_capture_trigger_with_text(reason, NULL);
 }
 
 /* Spin until target_us, yielding to other Core 1 work between checks.
@@ -202,6 +219,10 @@ static void hs_capture_task(void *arg)
                cec_trigger_name(reason),
                s_pre_count, HS_BURST_BUF_SIZE,
                (int)state_at_trigger);
+        if (s_pending_annotation[0] != '\0') {
+            printf(">BURST_ANNOTATION:%s\n", s_pending_annotation);
+            s_pending_annotation[0] = '\0';
+        }
         dump_pretrigger(state_at_trigger);
         dump_hs(hs_start_us);
         printf(">BURST_END\n");
