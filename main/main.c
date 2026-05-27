@@ -497,7 +497,7 @@ void app_main(void)
         if (iter % TELEPLOT_DIVIDER == 0) {
             /* Use the device-side millisecond clock for every TelePlot
              * row so the slow-loop output shares a time base with the
-             * burst-capture b_*/hs_* streams. Without this TelePlot
+             * burst-capture b_*hs_* streams. Without this TelePlot
              * auto-stamps with the host wallclock and the two streams
              * can't be aligned. */
             int64_t now_ms = esp_timer_get_time() / 1000;
