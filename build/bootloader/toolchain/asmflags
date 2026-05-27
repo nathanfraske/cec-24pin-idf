@@ -1,0 +1,5 @@
+"-specs=C:/Users/Admin/CEC Monitoring/cec-24pin-idf/build/bootloader/specs/picolibc.specs"
+-mlongcalls
+-fno-builtin-memcpy
+-fno-builtin-memset
+-fno-builtin-bzero

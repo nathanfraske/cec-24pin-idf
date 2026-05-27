@@ -1,0 +1,2 @@
+source C:/Users/Admin/CEC Monitoring/cec-24pin-idf/build/bootloader/gdbinit/symbols
+source C:/Users/Admin/CEC Monitoring/cec-24pin-idf/build/bootloader/gdbinit/connect

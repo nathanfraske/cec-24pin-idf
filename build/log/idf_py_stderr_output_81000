@@ -1,0 +1,140 @@
+Command: cmake -G Ninja -B C:\Users\Admin\CEC Monitoring\cec-24pin-idf\build -DPYTHON_DEPS_CHECKED=1 -DPYTHON=C:\Espressif\tools\python\v6.0.1\venv\Scripts\python.exe -DESP_PLATFORM=1 -DIDF_TARGET=esp32s3 -DCCACHE_ENABLE=False C:\Users\Admin\CEC Monitoring\cec-24pin-idf
+Loading defaults file C:/Users/Admin/CEC Monitoring/cec-24pin-idf/sdkconfig.defaults...
+Configuration Report               
++---------------------------------+
+|  Parser Version: 1              |
+|  Verbosity: default             |
+|  Defaults policy: sdkconfig     |
+|  Status: Finished successfully  |
+|                                 |
++---------------------------------+
+Traceback (most recent call last):
+  File "C:\esp\v6.0.1\esp-idf\components\partition_table\gen_esp32part.py", line 227, in from_csv
+    res.append(PartitionDefinition.from_csv(line, line_no + 1))
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\esp\v6.0.1\esp-idf\components\partition_table\gen_esp32part.py", line 461, in from_csv
+    raise InputError("Size field can't be empty")
+gen_esp32part.InputError: Size field can't be empty
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "C:\esp\v6.0.1\esp-idf\components\partition_table\parttool.py", line 408, in <module>
+    main()
+  File "C:\esp\v6.0.1\esp-idf\components\partition_table\parttool.py", line 377, in main
+    target = ParttoolTarget(**target_args)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\esp\v6.0.1\esp-idf\components\partition_table\parttool.py", line 95, in __init__
+    partition_table, _ = gen.PartitionTable.from_file(f)
+                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\esp\v6.0.1\esp-idf\components\partition_table\gen_esp32part.py", line 208, in from_file
+    return cls.from_csv(str_data), False
+           ^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\esp\v6.0.1\esp-idf\components\partition_table\gen_esp32part.py", line 229, in from_csv
+    raise InputError(
+gen_esp32part.InputError: Error at line 11: Size field can't be empty
+Please check extra_partition_subtypes.inc file in build/config directory
+Traceback (most recent call last):
+  File "C:\esp\v6.0.1\esp-idf\components\partition_table\gen_esp32part.py", line 227, in from_csv
+    res.append(PartitionDefinition.from_csv(line, line_no + 1))
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\esp\v6.0.1\esp-idf\components\partition_table\gen_esp32part.py", line 461, in from_csv
+    raise InputError("Size field can't be empty")
+gen_esp32part.InputError: Size field can't be empty
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "C:\esp\v6.0.1\esp-idf\components\partition_table\parttool.py", line 408, in <module>
+    main()
+  File "C:\esp\v6.0.1\esp-idf\components\partition_table\parttool.py", line 377, in main
+    target = ParttoolTarget(**target_args)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\esp\v6.0.1\esp-idf\components\partition_table\parttool.py", line 95, in __init__
+    partition_table, _ = gen.PartitionTable.from_file(f)
+                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\esp\v6.0.1\esp-idf\components\partition_table\gen_esp32part.py", line 208, in from_file
+    return cls.from_csv(str_data), False
+           ^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\esp\v6.0.1\esp-idf\components\partition_table\gen_esp32part.py", line 229, in from_csv
+    raise InputError(
+gen_esp32part.InputError: Error at line 11: Size field can't be empty
+Please check extra_partition_subtypes.inc file in build/config directory
+Traceback (most recent call last):
+  File "C:\esp\v6.0.1\esp-idf\components\partition_table\gen_esp32part.py", line 227, in from_csv
+    res.append(PartitionDefinition.from_csv(line, line_no + 1))
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\esp\v6.0.1\esp-idf\components\partition_table\gen_esp32part.py", line 461, in from_csv
+    raise InputError("Size field can't be empty")
+gen_esp32part.InputError: Size field can't be empty
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "C:\esp\v6.0.1\esp-idf\components\partition_table\parttool.py", line 408, in <module>
+    main()
+  File "C:\esp\v6.0.1\esp-idf\components\partition_table\parttool.py", line 377, in main
+    target = ParttoolTarget(**target_args)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\esp\v6.0.1\esp-idf\components\partition_table\parttool.py", line 95, in __init__
+    partition_table, _ = gen.PartitionTable.from_file(f)
+                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\esp\v6.0.1\esp-idf\components\partition_table\gen_esp32part.py", line 208, in from_file
+    return cls.from_csv(str_data), False
+           ^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\esp\v6.0.1\esp-idf\components\partition_table\gen_esp32part.py", line 229, in from_csv
+    raise InputError(
+gen_esp32part.InputError: Error at line 11: Size field can't be empty
+Please check extra_partition_subtypes.inc file in build/config directory
+Traceback (most recent call last):
+  File "C:\esp\v6.0.1\esp-idf\components\partition_table\gen_esp32part.py", line 227, in from_csv
+    res.append(PartitionDefinition.from_csv(line, line_no + 1))
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\esp\v6.0.1\esp-idf\components\partition_table\gen_esp32part.py", line 461, in from_csv
+    raise InputError("Size field can't be empty")
+gen_esp32part.InputError: Size field can't be empty
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "C:\esp\v6.0.1\esp-idf\components\partition_table\parttool.py", line 408, in <module>
+    main()
+  File "C:\esp\v6.0.1\esp-idf\components\partition_table\parttool.py", line 377, in main
+    target = ParttoolTarget(**target_args)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\esp\v6.0.1\esp-idf\components\partition_table\parttool.py", line 95, in __init__
+    partition_table, _ = gen.PartitionTable.from_file(f)
+                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\esp\v6.0.1\esp-idf\components\partition_table\gen_esp32part.py", line 208, in from_file
+    return cls.from_csv(str_data), False
+           ^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\esp\v6.0.1\esp-idf\components\partition_table\gen_esp32part.py", line 229, in from_csv
+    raise InputError(
+gen_esp32part.InputError: Error at line 11: Size field can't be empty
+Please check extra_partition_subtypes.inc file in build/config directory
+Traceback (most recent call last):
+  File "C:\esp\v6.0.1\esp-idf\components\partition_table\gen_esp32part.py", line 227, in from_csv
+    res.append(PartitionDefinition.from_csv(line, line_no + 1))
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\esp\v6.0.1\esp-idf\components\partition_table\gen_esp32part.py", line 461, in from_csv
+    raise InputError("Size field can't be empty")
+gen_esp32part.InputError: Size field can't be empty
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "C:\esp\v6.0.1\esp-idf\components\partition_table\parttool.py", line 408, in <module>
+    main()
+  File "C:\esp\v6.0.1\esp-idf\components\partition_table\parttool.py", line 377, in main
+    target = ParttoolTarget(**target_args)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\esp\v6.0.1\esp-idf\components\partition_table\parttool.py", line 95, in __init__
+    partition_table, _ = gen.PartitionTable.from_file(f)
+                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\esp\v6.0.1\esp-idf\components\partition_table\gen_esp32part.py", line 208, in from_file
+    return cls.from_csv(str_data), False
+           ^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\esp\v6.0.1\esp-idf\components\partition_table\gen_esp32part.py", line 229, in from_csv
+    raise InputError(
+gen_esp32part.InputError: Error at line 11: Size field can't be empty
+Please check extra_partition_subtypes.inc file in build/config directory

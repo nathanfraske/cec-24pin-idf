@@ -1,0 +1,40 @@
+# CEC 24-pin Module — sdkconfig defaults for ESP32-S3 N16R8
+#
+# Generate sdkconfig from this with: idf.py set-target esp32s3 && idf.py menuconfig
+# (the menuconfig step picks up these defaults; modify them there for tuning)
+
+# Target
+CONFIG_IDF_TARGET="esp32s3"
+
+# Flash size (Lonely Binary N16R8 has 16 MB flash)
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
+
+# PSRAM (Lonely Binary N16R8 uses 8 MB octal PSRAM)
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_TYPE_AUTO=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_BOOT_INIT=y
+CONFIG_SPIRAM_USE_MALLOC=y
+
+# CPU frequency
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
+# Custom partition table
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# Disable WiFi and BT in the bootloader to save startup time and memory
+# (we don't use either)
+CONFIG_ESP_WIFI_ENABLED=n
+CONFIG_BT_ENABLED=n
+
+# USB CDC for high-speed Serial via native USB
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# Log level (can be tightened in production)
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# Compiler optimization
+CONFIG_COMPILER_OPTIMIZATION_PERF=y

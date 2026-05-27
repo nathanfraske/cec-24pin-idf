@@ -1,0 +1,11 @@
+# CEC 24-pin Module partition table
+# Target: ESP32-S3 N16R8 (16 MB flash)
+#
+# Minimal layout for early development. OTA slots and bulk storage will be
+# added later when needed. Default nvs partition holds learned profiles and
+# calibration via standard namespaces.
+#
+# Name,    Type, SubType,  Offset,   Size,
+nvs,       data, nvs,      0x9000,   24K,
+phy_init,  data, phy,      0xf000,   4K,
+factory,   app,  factory,  0x10000,  4M,
