@@ -98,7 +98,15 @@ esp_err_t cec_capture_trigger(cec_trigger_t reason)
 /* Spin until target_us, yielding to other Core 1 work between checks.
  * At our priority on a dedicated core there's almost nothing else to
  * run, but yielding keeps the watchdog happy and lets background tasks
- * (IDF event loops, etc.) breathe. */
+ * (IDF event loops, etc.) breathe.
+ *
+ * Observed jitter: ~5% of HS samples land ~1 ms late under load (giving
+ * 2 ms between rows instead of 1 ms). Most likely cause is cross-core
+ * ADC oneshot lock contention with the main loop's reads on Core 0;
+ * each missed window is roughly the length of one main-loop ADC read.
+ * Acceptable for transient capture, problematic for contiguous waveform
+ * analysis. The proper fix is ADC continuous mode (DMA), which is its
+ * own README item. */
 static void spin_until(int64_t target_us)
 {
     while ((int64_t)(esp_timer_get_time() - target_us) < 0) {

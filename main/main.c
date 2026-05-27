@@ -68,9 +68,15 @@ static const char *TAG = "cec_main";
 #define ACS712_DIVIDER       ((20000.0f + 30000.0f) / 30000.0f)
 #define ACS712_30A_SENS      0.066f
 #define ACS712_20A_SENS      0.100f
-/* No-load output at the post-divider voltage. Nominal Vcc/2 ~ 2.20 V;
- * needs per-unit calibration once the serial-command path lands. */
-#define ACS712_ZERO_DEFAULT  2.20f
+/* Per-rail no-load output (post-divider voltage). Nominal Vcc/2 = 2.20 V
+ * but the part-to-part variation is several tens of mV (hundreds of mA
+ * at these sensitivities), so each rail gets its own constant for hand-
+ * tuning. The boot-time diagnostic logs the measured no-load output —
+ * with the PSU disconnected at first boot, copy those values here. Full
+ * runtime calibration lands with the serial-command + NVS path. */
+#define ACS712_ZERO_12V      2.20f
+#define ACS712_ZERO_5V       2.20f
+#define ACS712_ZERO_3V3      2.20f
 
 /* Loop cadence. Sample at 50 Hz to match v0.5.9; emit TelePlot at 10 Hz
  * (every 5th iteration); log an INFO summary at 1 Hz (every 50th). */
@@ -119,19 +125,19 @@ static const acs712_t s_acs_12v = {
     .channel = ADC_CH_I_12V, .samples = 4,
     .divider_scale = ACS712_DIVIDER,
     .sensitivity_v_per_a = ACS712_30A_SENS,
-    .zero_point_v = ACS712_ZERO_DEFAULT,
+    .zero_point_v = ACS712_ZERO_12V,
 };
 static const acs712_t s_acs_5v = {
     .channel = ADC_CH_I_5V,  .samples = 4,
     .divider_scale = ACS712_DIVIDER,
     .sensitivity_v_per_a = ACS712_20A_SENS,
-    .zero_point_v = ACS712_ZERO_DEFAULT,
+    .zero_point_v = ACS712_ZERO_5V,
 };
 static const acs712_t s_acs_3v3 = {
     .channel = ADC_CH_I_3V3, .samples = 4,
     .divider_scale = ACS712_DIVIDER,
     .sensitivity_v_per_a = ACS712_20A_SENS,
-    .zero_point_v = ACS712_ZERO_DEFAULT,
+    .zero_point_v = ACS712_ZERO_3V3,
 };
 
 /* HS-rate configs (samples=1) used by the burst capture engine to keep
@@ -150,19 +156,19 @@ static const acs712_t s_hs_acs_12v = {
     .channel = ADC_CH_I_12V, .samples = 1,
     .divider_scale = ACS712_DIVIDER,
     .sensitivity_v_per_a = ACS712_30A_SENS,
-    .zero_point_v = ACS712_ZERO_DEFAULT,
+    .zero_point_v = ACS712_ZERO_12V,
 };
 static const acs712_t s_hs_acs_5v = {
     .channel = ADC_CH_I_5V,  .samples = 1,
     .divider_scale = ACS712_DIVIDER,
     .sensitivity_v_per_a = ACS712_20A_SENS,
-    .zero_point_v = ACS712_ZERO_DEFAULT,
+    .zero_point_v = ACS712_ZERO_5V,
 };
 static const acs712_t s_hs_acs_3v3 = {
     .channel = ADC_CH_I_3V3, .samples = 1,
     .divider_scale = ACS712_DIVIDER,
     .sensitivity_v_per_a = ACS712_20A_SENS,
-    .zero_point_v = ACS712_ZERO_DEFAULT,
+    .zero_point_v = ACS712_ZERO_3V3,
 };
 
 /* Filter state */
@@ -267,6 +273,41 @@ static layer1_step_result_t layer1_step(const char *rail_name,
     };
 }
 
+/* Sample each ACS712's no-load output and log what it reads, along with
+ * the equivalent offset current vs. the constants currently compiled in.
+ * Run once at boot before the main loop starts feeding the sensors.
+ * Lets you copy the measured no-load voltages directly into
+ * ACS712_ZERO_{12V,5V,3V3} for a per-unit-tuned offset until the proper
+ * serial-command / NVS calibration path lands. */
+static void log_acs712_zero_measurements(void)
+{
+    struct {
+        const char *name;
+        const acs712_t *cfg;
+        float compiled_zero;
+        float sens;
+    } rails[] = {
+        { "12V", &s_acs_12v, ACS712_ZERO_12V, ACS712_30A_SENS },
+        { "5V",  &s_acs_5v,  ACS712_ZERO_5V,  ACS712_20A_SENS },
+        { "3V3", &s_acs_3v3, ACS712_ZERO_3V3, ACS712_20A_SENS },
+    };
+    ESP_LOGI(TAG, "ACS712 no-load diagnostic (200-sample average):");
+    for (size_t i = 0; i < sizeof(rails) / sizeof(rails[0]); i++) {
+        float measured = 0.0f;
+        esp_err_t err = acs712_measure_zero_point(rails[i].cfg, 200, &measured);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "  %s: measure failed (%s)", rails[i].name, esp_err_to_name(err));
+            continue;
+        }
+        float implied_a = (measured - rails[i].compiled_zero) / rails[i].sens;
+        ESP_LOGI(TAG, "  %s: measured=%.4f V, compiled=%.4f V "
+                      "=> implied no-load current = %+.3f A",
+                 rails[i].name, measured, rails[i].compiled_zero, implied_a);
+    }
+    ESP_LOGI(TAG, "If \"implied no-load current\" is non-zero with PSU "
+                  "disconnected, paste the measured V into ACS712_ZERO_<rail>.");
+}
+
 /* Burst capture HS sample callback. Runs at 1 kHz on the cec_hs_cap task
  * (Core 1) — must stay well under 1 ms. Six oneshot ADC reads + scaling
  * comfortably fit. */
@@ -335,6 +376,8 @@ void app_main(void)
     ema_init(&s_temp_ema,   EMA_ALPHA_FAST);
 
     init_layer1();
+
+    log_acs712_zero_measurements();
 
     err = cec_capture_init(hs_sample_fn);
     if (err != ESP_OK) {
@@ -452,25 +495,31 @@ void app_main(void)
         cec_capture_push(&pre);
 
         if (iter % TELEPLOT_DIVIDER == 0) {
+            /* Use the device-side millisecond clock for every TelePlot
+             * row so the slow-loop output shares a time base with the
+             * burst-capture b_*/hs_* streams. Without this TelePlot
+             * auto-stamps with the host wallclock and the two streams
+             * can't be aligned. */
+            int64_t now_ms = esp_timer_get_time() / 1000;
             if (ok_5vsb) {
-                teleplot_emit("v_5vsb",     v_5vsb);
-                teleplot_emit("v_5vsb_ema", v_5vsb_ema);
-                teleplot_emit("i_5vsb_raw", i_5vsb);
-                teleplot_emit("i_5vsb_ema", i_5vsb_ema);
+                teleplot_emit_t("v_5vsb",     now_ms, v_5vsb);
+                teleplot_emit_t("v_5vsb_ema", now_ms, v_5vsb_ema);
+                teleplot_emit_t("i_5vsb_raw", now_ms, i_5vsb);
+                teleplot_emit_t("i_5vsb_ema", now_ms, i_5vsb_ema);
             }
-            if (ok_v_12v) { teleplot_emit("v_12v", v_12v); teleplot_emit("v_12v_ema", v_12v_ema); }
-            if (ok_v_5v)  { teleplot_emit("v_5v",  v_5v);  teleplot_emit("v_5v_ema",  v_5v_ema);  }
-            if (ok_v_3v3) { teleplot_emit("v_3v3", v_3v3); teleplot_emit("v_3v3_ema", v_3v3_ema); }
-            if (ok_i_12v) { teleplot_emit("i_12v", i_12v); teleplot_emit("i_12v_ema", i_12v_ema); }
-            if (ok_i_5v)  { teleplot_emit("i_5v",  i_5v);  teleplot_emit("i_5v_ema",  i_5v_ema);  }
-            if (ok_i_3v3) { teleplot_emit("i_3v3", i_3v3); teleplot_emit("i_3v3_ema", i_3v3_ema); }
-            if (ok_temp)  { teleplot_emit("temp_c", temp_c); teleplot_emit("temp_c_ema", temp_ema); }
-            teleplot_emit("p_total", p_total);
-            teleplot_emit("state",   (float)s_state);
-            teleplot_emit("sev_12v",  (float)sev_12v);
-            teleplot_emit("sev_5v",   (float)sev_5v);
-            teleplot_emit("sev_3v3",  (float)sev_3v3);
-            teleplot_emit("sev_5vsb", (float)sev_5vsb);
+            if (ok_v_12v) { teleplot_emit_t("v_12v", now_ms, v_12v); teleplot_emit_t("v_12v_ema", now_ms, v_12v_ema); }
+            if (ok_v_5v)  { teleplot_emit_t("v_5v",  now_ms, v_5v);  teleplot_emit_t("v_5v_ema",  now_ms, v_5v_ema);  }
+            if (ok_v_3v3) { teleplot_emit_t("v_3v3", now_ms, v_3v3); teleplot_emit_t("v_3v3_ema", now_ms, v_3v3_ema); }
+            if (ok_i_12v) { teleplot_emit_t("i_12v", now_ms, i_12v); teleplot_emit_t("i_12v_ema", now_ms, i_12v_ema); }
+            if (ok_i_5v)  { teleplot_emit_t("i_5v",  now_ms, i_5v);  teleplot_emit_t("i_5v_ema",  now_ms, i_5v_ema);  }
+            if (ok_i_3v3) { teleplot_emit_t("i_3v3", now_ms, i_3v3); teleplot_emit_t("i_3v3_ema", now_ms, i_3v3_ema); }
+            if (ok_temp)  { teleplot_emit_t("temp_c", now_ms, temp_c); teleplot_emit_t("temp_c_ema", now_ms, temp_ema); }
+            teleplot_emit_t("p_total", now_ms, p_total);
+            teleplot_emit_t("state",   now_ms, (float)s_state);
+            teleplot_emit_t("sev_12v",  now_ms, (float)sev_12v);
+            teleplot_emit_t("sev_5v",   now_ms, (float)sev_5v);
+            teleplot_emit_t("sev_3v3",  now_ms, (float)sev_3v3);
+            teleplot_emit_t("sev_5vsb", now_ms, (float)sev_5vsb);
         }
 
         if (iter % LOG_DIVIDER == 0) {
