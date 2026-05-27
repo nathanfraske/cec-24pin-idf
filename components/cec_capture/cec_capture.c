@@ -168,16 +168,35 @@ static void hs_capture_task(void *arg)
 
         int64_t hs_start_us = esp_timer_get_time();
         int64_t target_us = hs_start_us;
+        int zero_artifacts = 0;
         for (int i = 0; i < HS_BURST_BUF_SIZE; i++) {
             target_us += HS_SAMPLE_INTERVAL_US;
             spin_until(target_us);
             cec_capture_hs_sample_t *s = &s_hs_buf[i];
             s->ts_us_offset = (uint32_t)(esp_timer_get_time() - hs_start_us);
             s_hs_fn(s);
+
+            /* SAR-ADC glitch mitigation: empirically ~1% of samples come
+             * back with all three voltages at exactly 0.0 even though the
+             * underlying reads returned ESP_OK. Indistinguishable from a
+             * real "all rails off" except by likelihood — for HS capture
+             * the carry-forward is far more useful than the zero dip, and
+             * the trade-off only bites if a burst happens to be running
+             * across a true full-rail collapse (which is rare and will
+             * show as a flat-line in the carry-forward window). */
+            if (i > 0 && s->v_12v == 0.0f && s->v_5v == 0.0f && s->v_3v3 == 0.0f) {
+                const cec_capture_hs_sample_t *prev = &s_hs_buf[i - 1];
+                s->v_12v = prev->v_12v; s->i_12v = prev->i_12v;
+                s->v_5v  = prev->v_5v;  s->i_5v  = prev->i_5v;
+                s->v_3v3 = prev->v_3v3; s->i_3v3 = prev->i_3v3;
+                zero_artifacts++;
+            }
         }
         int64_t hs_end_us = esp_timer_get_time();
-        ESP_LOGI(TAG, "HS capture done in %lld us, dumping pre+HS to TelePlot",
-                 (long long)(hs_end_us - hs_start_us));
+        ESP_LOGI(TAG, "HS capture done in %lld us (zero-artifact replacements: %d/%d), "
+                      "dumping pre+HS to TelePlot",
+                 (long long)(hs_end_us - hs_start_us),
+                 zero_artifacts, HS_BURST_BUF_SIZE);
 
         printf(">BURST_BEGIN:%s:%d_normal+%d_hs:%d\n",
                cec_trigger_name(reason),

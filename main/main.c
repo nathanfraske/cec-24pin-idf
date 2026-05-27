@@ -187,6 +187,14 @@ static int64_t s_state_entered_us = 0;
 /* Layer 1 static-threshold detectors per rail. Bands carry forward from
  * v0.5.9: 5%/10% on main rails, 10%/20% on 5VSB. */
 #define L1_CRIT_CONSECUTIVE 3
+
+/* Mask Layer 1 for this long after every state transition. Covers the
+ * PSU inrush (most visibly on 5VSB OFF -> STANDBY ramp, where the rail
+ * passes through 1..5 V on its way up and would otherwise sustain
+ * CRITICAL for the consecutive-sample window). 500 ms is loose enough
+ * for typical PSU ramp times and tight enough not to miss real faults. */
+#define LAYER1_SETTLE_US  (500LL * 1000)
+
 static cec_layer1_detector_t s_l1_12v, s_l1_5v, s_l1_3v3, s_l1_5vsb;
 static cec_severity_t s_last_sev_12v  = CEC_SEV_NONE;
 static cec_severity_t s_last_sev_5v   = CEC_SEV_NONE;
@@ -445,18 +453,30 @@ void app_main(void)
             s_state_entered_us = now_us;
         }
 
-        /* Layer 1 main rails: only check in IDLE/ACTIVE/PEAK. During
-         * OFF/STANDBY the rails are 0 V or ramping, and the brief
-         * mid-range values during power-up would otherwise sustain a
-         * spurious CRITICAL for several iterations. 5VSB is on whenever
-         * the PSU is plugged in, so its detector runs unconditionally
-         * and relies on the RAIL_OFF check to handle the actually-off
-         * state. */
+        /* Layer 1 gating:
+         *   - Main rails (12V/5V/3V3) only check in IDLE/ACTIVE/PEAK,
+         *     since OFF/STANDBY has them at 0 V and the ramp passes
+         *     through out-of-band values.
+         *   - 5VSB checks any time the rail is supposed to be present
+         *     (everything except OFF).
+         *   - Both wait LAYER1_SETTLE_US after every state transition
+         *     so the PSU's inrush ramp doesn't trip a false CRITICAL.
+         *     Detectors are reset during the settle window so the
+         *     consecutive-sample counter doesn't accumulate from the
+         *     ramp.
+         */
+        bool l1_settled = (esp_timer_get_time() - s_state_entered_us) > LAYER1_SETTLE_US;
+        bool main_rails_armed = l1_settled
+            && (s_state == CEC_STATE_IDLE || s_state == CEC_STATE_ACTIVE || s_state == CEC_STATE_PEAK);
+        bool sb_rail_armed = l1_settled && (s_state != CEC_STATE_OFF);
+
         cec_severity_t sev_12v = CEC_SEV_NONE;
         cec_severity_t sev_5v  = CEC_SEV_NONE;
         cec_severity_t sev_3v3 = CEC_SEV_NONE;
+        cec_severity_t sev_5vsb = CEC_SEV_NONE;
         bool any_entered_crit = false;
-        if (s_state == CEC_STATE_IDLE || s_state == CEC_STATE_ACTIVE || s_state == CEC_STATE_PEAK) {
+
+        if (main_rails_armed) {
             layer1_step_result_t r;
             r = layer1_step("12V", &s_l1_12v, &s_last_sev_12v, v_12v_ema);
             sev_12v = r.sev; any_entered_crit |= r.entered_critical;
@@ -469,9 +489,13 @@ void app_main(void)
             cec_layer1_reset(&s_l1_5v);  s_last_sev_5v  = CEC_SEV_NONE;
             cec_layer1_reset(&s_l1_3v3); s_last_sev_3v3 = CEC_SEV_NONE;
         }
-        layer1_step_result_t r5sb = layer1_step("5VSB", &s_l1_5vsb, &s_last_sev_5vsb, v_5vsb_ema);
-        cec_severity_t sev_5vsb = r5sb.sev;
-        any_entered_crit |= r5sb.entered_critical;
+        if (sb_rail_armed) {
+            layer1_step_result_t r5sb = layer1_step("5VSB", &s_l1_5vsb, &s_last_sev_5vsb, v_5vsb_ema);
+            sev_5vsb = r5sb.sev;
+            any_entered_crit |= r5sb.entered_critical;
+        } else {
+            cec_layer1_reset(&s_l1_5vsb); s_last_sev_5vsb = CEC_SEV_NONE;
+        }
 
         if (any_entered_crit) {
             esp_err_t terr = cec_capture_trigger(CEC_TRIG_STATIC_CRIT);
