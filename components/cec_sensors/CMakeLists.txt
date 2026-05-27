@@ -2,9 +2,8 @@ idf_component_register(
     SRCS
         "ina226.c"
         "cec_adc.c"
-        # Source files added during porting:
-        # "acs712.c"
-        # "thermistor.c"
+        "thermistor.c"
+        "acs712.c"
     INCLUDE_DIRS "include"
     REQUIRES
         esp_driver_i2c

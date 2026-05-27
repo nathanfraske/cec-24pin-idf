@@ -50,13 +50,15 @@ Tracking the port progress from Arduino-ESP32 v0.5.9 to ESP-IDF:
 | Hello World boot | Pending hardware test |
 | I2C master driver (for INA226) | Done |
 | ADC oneshot reads — rail voltages (12V/5V/3V3) | Done |
-| ADC oneshot reads — rail currents (i_12V/i_5V/i_3V3 via ACS712) | Pending |
+| ADC oneshot reads — NTC temperature | Done |
+| ADC oneshot reads — rail currents (i_12V/i_5V/i_3V3 via ACS712) | Done (zero-point cal pending) |
 | ADC continuous mode (for HS burst) | Pending |
-| Sample loop at 50 Hz | Pending |
+| Sample loop at 50 Hz | Done |
 | EMA / median filter primitives | Done |
 | Teleplot output via USB CDC | Done |
-| State classifier | Pending |
-| Layer 1/2/3 detectors | Pending |
+| State classifier | Done |
+| Layer 1 static thresholds | Done |
+| Layer 2 (adaptive transient) + Layer 3 (Z-score anomaly) | Pending |
 | Burst capture engine | Pending |
 | NVS profile storage | Pending |
 | Serial command interface | Pending |
