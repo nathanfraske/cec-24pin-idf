@@ -32,6 +32,7 @@
 #include "cec_filters.h"
 #include "cec_state.h"
 #include "cec_layer1.h"
+#include "cec_capture.h"
 #include "cec_teleplot.h"
 
 static const char *TAG = "cec_main";
@@ -133,6 +134,37 @@ static const acs712_t s_acs_3v3 = {
     .zero_point_v = ACS712_ZERO_DEFAULT,
 };
 
+/* HS-rate configs (samples=1) used by the burst capture engine to keep
+ * each 1 kHz iteration well under the 1 ms budget. Scale/trim/zero match
+ * the main-loop configs above. */
+static const cec_adc_rail_t s_hs_rail_12v = {
+    .channel = ADC_CH_V_12V, .samples = 1, .scale = SCALE_12V, .trim = TRIM_12V,
+};
+static const cec_adc_rail_t s_hs_rail_5v = {
+    .channel = ADC_CH_V_5V,  .samples = 1, .scale = SCALE_5V,  .trim = TRIM_5V,
+};
+static const cec_adc_rail_t s_hs_rail_3v3 = {
+    .channel = ADC_CH_V_3V3, .samples = 1, .scale = SCALE_3V3, .trim = TRIM_3V3,
+};
+static const acs712_t s_hs_acs_12v = {
+    .channel = ADC_CH_I_12V, .samples = 1,
+    .divider_scale = ACS712_DIVIDER,
+    .sensitivity_v_per_a = ACS712_30A_SENS,
+    .zero_point_v = ACS712_ZERO_DEFAULT,
+};
+static const acs712_t s_hs_acs_5v = {
+    .channel = ADC_CH_I_5V,  .samples = 1,
+    .divider_scale = ACS712_DIVIDER,
+    .sensitivity_v_per_a = ACS712_20A_SENS,
+    .zero_point_v = ACS712_ZERO_DEFAULT,
+};
+static const acs712_t s_hs_acs_3v3 = {
+    .channel = ADC_CH_I_3V3, .samples = 1,
+    .divider_scale = ACS712_DIVIDER,
+    .sensitivity_v_per_a = ACS712_20A_SENS,
+    .zero_point_v = ACS712_ZERO_DEFAULT,
+};
+
 /* Filter state */
 static ema_t s_v_5vsb_ema, s_i_5vsb_ema;
 static ema_t s_v_12v_ema, s_v_5v_ema, s_v_3v3_ema;
@@ -204,16 +236,23 @@ static void init_layer1(void)
     cec_layer1_init(&s_l1_5vsb, &SPEC_5VSB, L1_CRIT_CONSECUTIVE);
 }
 
-/* Update one rail's Layer 1 detector and log on severity transitions.
- * Returns the new sustained severity so the caller can also publish it
- * (e.g. on a TelePlot trace). */
-static cec_severity_t layer1_step(const char *rail_name,
-                                  cec_layer1_detector_t *d,
-                                  cec_severity_t *last_sev,
-                                  float v_rail)
+typedef struct {
+    cec_severity_t sev;
+    bool entered_critical;   /* true on the iteration where sev steps to CRITICAL */
+} layer1_step_result_t;
+
+/* Update one rail's Layer 1 detector, log on severity transitions, and
+ * report whether this is the iteration on which the rail just stepped
+ * into CRITICAL — the caller uses that to fire a burst trigger exactly
+ * once per fault entry. */
+static layer1_step_result_t layer1_step(const char *rail_name,
+                                        cec_layer1_detector_t *d,
+                                        cec_severity_t *last_sev,
+                                        float v_rail)
 {
+    cec_severity_t prev = *last_sev;
     cec_severity_t sev = cec_layer1_update(d, v_rail);
-    if (sev != *last_sev) {
+    if (sev != prev) {
         if (sev != CEC_SEV_NONE) {
             ESP_LOGW(TAG, "L1: %s %s (v=%.3f, nominal=%.2f)",
                      rail_name, cec_severity_name(sev), v_rail, d->spec.nominal);
@@ -222,7 +261,23 @@ static cec_severity_t layer1_step(const char *rail_name,
         }
         *last_sev = sev;
     }
-    return sev;
+    return (layer1_step_result_t){
+        .sev = sev,
+        .entered_critical = (prev != CEC_SEV_CRITICAL && sev == CEC_SEV_CRITICAL),
+    };
+}
+
+/* Burst capture HS sample callback. Runs at 1 kHz on the cec_hs_cap task
+ * (Core 1) — must stay well under 1 ms. Six oneshot ADC reads + scaling
+ * comfortably fit. */
+static void hs_sample_fn(cec_capture_hs_sample_t *out)
+{
+    cec_adc_read(&s_hs_rail_12v, &out->v_12v);
+    cec_adc_read(&s_hs_rail_5v,  &out->v_5v);
+    cec_adc_read(&s_hs_rail_3v3, &out->v_3v3);
+    acs712_read_amps(&s_hs_acs_12v, &out->i_12v);
+    acs712_read_amps(&s_hs_acs_5v,  &out->i_5v);
+    acs712_read_amps(&s_hs_acs_3v3, &out->i_3v3);
 }
 
 static void log_hardware_info(void)
@@ -280,6 +335,12 @@ void app_main(void)
     ema_init(&s_temp_ema,   EMA_ALPHA_FAST);
 
     init_layer1();
+
+    err = cec_capture_init(hs_sample_fn);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "cec_capture_init failed: %s", esp_err_to_name(err));
+        ESP_LOGW(TAG, "Continuing without burst capture");
+    }
 
     /* Sample at 50 Hz, emit TelePlot at 10 Hz, log an INFO summary at 1 Hz.
      * Read failures don't get spammed per-iteration; the divided cadence
@@ -348,16 +409,47 @@ void app_main(void)
         cec_severity_t sev_12v = CEC_SEV_NONE;
         cec_severity_t sev_5v  = CEC_SEV_NONE;
         cec_severity_t sev_3v3 = CEC_SEV_NONE;
+        bool any_entered_crit = false;
         if (s_state == CEC_STATE_IDLE || s_state == CEC_STATE_ACTIVE || s_state == CEC_STATE_PEAK) {
-            sev_12v = layer1_step("12V", &s_l1_12v, &s_last_sev_12v, v_12v_ema);
-            sev_5v  = layer1_step("5V",  &s_l1_5v,  &s_last_sev_5v,  v_5v_ema);
-            sev_3v3 = layer1_step("3V3", &s_l1_3v3, &s_last_sev_3v3, v_3v3_ema);
+            layer1_step_result_t r;
+            r = layer1_step("12V", &s_l1_12v, &s_last_sev_12v, v_12v_ema);
+            sev_12v = r.sev; any_entered_crit |= r.entered_critical;
+            r = layer1_step("5V",  &s_l1_5v,  &s_last_sev_5v,  v_5v_ema);
+            sev_5v  = r.sev; any_entered_crit |= r.entered_critical;
+            r = layer1_step("3V3", &s_l1_3v3, &s_last_sev_3v3, v_3v3_ema);
+            sev_3v3 = r.sev; any_entered_crit |= r.entered_critical;
         } else {
             cec_layer1_reset(&s_l1_12v); s_last_sev_12v = CEC_SEV_NONE;
             cec_layer1_reset(&s_l1_5v);  s_last_sev_5v  = CEC_SEV_NONE;
             cec_layer1_reset(&s_l1_3v3); s_last_sev_3v3 = CEC_SEV_NONE;
         }
-        cec_severity_t sev_5vsb = layer1_step("5VSB", &s_l1_5vsb, &s_last_sev_5vsb, v_5vsb_ema);
+        layer1_step_result_t r5sb = layer1_step("5VSB", &s_l1_5vsb, &s_last_sev_5vsb, v_5vsb_ema);
+        cec_severity_t sev_5vsb = r5sb.sev;
+        any_entered_crit |= r5sb.entered_critical;
+
+        if (any_entered_crit) {
+            esp_err_t terr = cec_capture_trigger(CEC_TRIG_STATIC_CRIT);
+            if (terr == ESP_OK) {
+                ESP_LOGW(TAG, "burst trigger: STATIC_CRIT");
+            } else if (terr == ESP_ERR_NOT_FINISHED) {
+                ESP_LOGW(TAG, "burst trigger: STATIC_CRIT skipped (capture busy)");
+            } else if (terr == ESP_ERR_INVALID_STATE) {
+                ESP_LOGW(TAG, "burst trigger: STATIC_CRIT skipped (cooldown)");
+            }
+        }
+
+        /* Push a pre-trigger sample every iteration so the ring buffer
+         * always holds the last ~20 s of filtered telemetry. */
+        cec_capture_sample_t pre = {
+            .ts_ms  = (uint32_t)(esp_timer_get_time() / 1000),
+            .state  = (uint8_t)s_state,
+            .v_12v  = v_12v_ema,  .i_12v  = i_12v_ema,
+            .v_5v   = v_5v_ema,   .i_5v   = i_5v_ema,
+            .v_3v3  = v_3v3_ema,  .i_3v3  = i_3v3_ema,
+            .v_5vsb = v_5vsb_ema, .i_5vsb = i_5vsb_ema,
+            .temp_c = temp_ema,
+        };
+        cec_capture_push(&pre);
 
         if (iter % TELEPLOT_DIVIDER == 0) {
             if (ok_5vsb) {
