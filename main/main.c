@@ -1,17 +1,19 @@
 /*
  * CEC 24-pin Module Firmware - ESP-IDF port
  *
- * Status: Bootstrap + INA226 driver validation
- *
- * Brings up the I2C bus and the INA226 on the 5VSB rail, matching the
- * v0.5.9 configuration (0.002 ohm shunt, 5 A max current, 0.9901 voltage
- * trim). Reads bus voltage and current at 5 Hz and logs to serial.
+ * Brings up the I2C bus + INA226 (5VSB), the ADC1 voltage-rail divider
+ * reads (12V/5V/3V3), and the NTC thermistor, all matching the v0.5.9
+ * hardware configuration. Samples everything at 50 Hz, runs each channel
+ * through a fast EMA, and emits TelePlot series at 10 Hz with a 1 Hz
+ * INFO summary line.
  *
  * Compare against v0.5.9 captures on the same hardware. Numbers should
- * match within measurement noise.
+ * match within measurement noise once per-unit trim is dialed in.
  */
 
 #include <stdio.h>
+#include <stdbool.h>
+#include <stdint.h>
 #include <inttypes.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -25,6 +27,7 @@
 
 #include "ina226.h"
 #include "cec_adc.h"
+#include "thermistor.h"
 #include "cec_filters.h"
 #include "cec_teleplot.h"
 
@@ -35,10 +38,11 @@ static const char *TAG = "cec_main";
 #define I2C_PIN_SCL       9
 #define I2C_PORT_NUM      I2C_NUM_0
 
-/* ADC1 channels for the voltage rails (GPIO1/2/3 = ADC1_CH0/1/2) */
-#define ADC_CH_V_12V      ADC_CHANNEL_0
-#define ADC_CH_V_5V       ADC_CHANNEL_1
-#define ADC_CH_V_3V3      ADC_CHANNEL_2
+/* ADC1 channels (GPIO1..7 = ADC1_CH0..6), pin map from v0.5.9 */
+#define ADC_CH_V_12V      ADC_CHANNEL_0   /* GPIO1 */
+#define ADC_CH_V_5V       ADC_CHANNEL_1   /* GPIO2 */
+#define ADC_CH_V_3V3      ADC_CHANNEL_2   /* GPIO3 */
+#define ADC_CH_NTC        ADC_CHANNEL_6   /* GPIO7 */
 
 /* Per-rail trim factors carried forward from v0.5.9 (hardware-specific) */
 #define TRIM_12V          1.0000f
@@ -51,11 +55,15 @@ static const char *TAG = "cec_main";
 #define SCALE_5V          ((15000.0f + 10000.0f) / 10000.0f)
 #define SCALE_3V3         (( 4700.0f + 10000.0f) / 10000.0f)
 
-/* EMA smoothing on the sampled rails. At the 5 Hz sample rate below this
- * gives a time constant of roughly 2 seconds — slow enough to make the
- * raw-vs-filtered traces visibly different in TelePlot. */
-#define EMA_ALPHA_I_5VSB  0.1f
-#define EMA_ALPHA_VOLTAGE 0.1f
+/* Loop cadence. Sample at 50 Hz to match v0.5.9; emit TelePlot at 10 Hz
+ * (every 5th iteration); log an INFO summary at 1 Hz (every 50th). */
+#define SAMPLE_PERIOD_MS  20
+#define TELEPLOT_DIVIDER  5
+#define LOG_DIVIDER       50
+
+/* EMA smoothing. At 50 Hz, alpha=0.02 gives a ~1 s time constant, matching
+ * the v0.5.9 EMA_ALPHA_FAST. */
+#define EMA_ALPHA_FAST    0.02f
 
 /* I2C bus handle (shared across components later) */
 static i2c_master_bus_handle_t s_i2c_bus = NULL;
@@ -63,20 +71,34 @@ static i2c_master_bus_handle_t s_i2c_bus = NULL;
 /* INA226 instances. For now only 5VSB. Will add 12V/5V/3V3 after PCB rev. */
 static ina226_handle_t s_ina226_5vsb = NULL;
 
-/* ADC rail configs */
+/* ADC rail configs. At 50 Hz the per-iteration ADC time budget is tight,
+ * so samples-per-read is dropped from 8 to 4 vs. the 5 Hz era. Calibration
+ * curve-fitting handles the rest. */
 static const cec_adc_rail_t s_rail_12v = {
-    .channel = ADC_CH_V_12V, .samples = 8, .scale = SCALE_12V, .trim = TRIM_12V,
+    .channel = ADC_CH_V_12V, .samples = 4, .scale = SCALE_12V, .trim = TRIM_12V,
 };
 static const cec_adc_rail_t s_rail_5v = {
-    .channel = ADC_CH_V_5V,  .samples = 8, .scale = SCALE_5V,  .trim = TRIM_5V,
+    .channel = ADC_CH_V_5V,  .samples = 4, .scale = SCALE_5V,  .trim = TRIM_5V,
 };
 static const cec_adc_rail_t s_rail_3v3 = {
-    .channel = ADC_CH_V_3V3, .samples = 8, .scale = SCALE_3V3, .trim = TRIM_3V3,
+    .channel = ADC_CH_V_3V3, .samples = 4, .scale = SCALE_3V3, .trim = TRIM_3V3,
+};
+
+/* NTC config carried forward from v0.5.9. Standard 10k @ 25C, B=3950. */
+static const thermistor_t s_ntc = {
+    .channel = ADC_CH_NTC,
+    .samples = 4,
+    .beta = 3950.0f,
+    .nominal_resistance = 10000.0f,
+    .nominal_temperature_k = 298.15f,
+    .pull_up_resistance = 10000.0f,
+    .vcc = 3.3f,
 };
 
 /* Filter state */
 static ema_t s_i_5vsb_ema;
 static ema_t s_v_12v_ema, s_v_5v_ema, s_v_3v3_ema;
+static ema_t s_temp_ema;
 
 static void init_i2c_bus(void)
 {
@@ -98,6 +120,7 @@ static esp_err_t init_adc_rails(void)
     ESP_RETURN_ON_ERROR(cec_adc_setup_channel(ADC_CH_V_12V), TAG, "setup 12V");
     ESP_RETURN_ON_ERROR(cec_adc_setup_channel(ADC_CH_V_5V),  TAG, "setup 5V");
     ESP_RETURN_ON_ERROR(cec_adc_setup_channel(ADC_CH_V_3V3), TAG, "setup 3V3");
+    ESP_RETURN_ON_ERROR(thermistor_setup(&s_ntc),            TAG, "setup NTC");
     return ESP_OK;
 }
 
@@ -158,70 +181,57 @@ void app_main(void)
         ESP_LOGW(TAG, "Continuing without ADC rail readings");
     }
 
-    ema_init(&s_i_5vsb_ema, EMA_ALPHA_I_5VSB);
-    ema_init(&s_v_12v_ema,  EMA_ALPHA_VOLTAGE);
-    ema_init(&s_v_5v_ema,   EMA_ALPHA_VOLTAGE);
-    ema_init(&s_v_3v3_ema,  EMA_ALPHA_VOLTAGE);
+    ema_init(&s_i_5vsb_ema, EMA_ALPHA_FAST);
+    ema_init(&s_v_12v_ema,  EMA_ALPHA_FAST);
+    ema_init(&s_v_5v_ema,   EMA_ALPHA_FAST);
+    ema_init(&s_v_3v3_ema,  EMA_ALPHA_FAST);
+    ema_init(&s_temp_ema,   EMA_ALPHA_FAST);
 
-    /* Main loop: at 5 Hz, read INA226 + ADC rails, log a summary and
-     * emit TelePlot series for every channel on every iteration. */
-    ESP_LOGI(TAG, "Entering main loop");
+    /* Sample at 50 Hz, emit TelePlot at 10 Hz, log an INFO summary at 1 Hz.
+     * Read failures don't get spammed per-iteration; the divided cadence
+     * makes them visible as gaps in TelePlot and bad values in the summary. */
+    ESP_LOGI(TAG, "Entering main loop (sample=50 Hz, teleplot=10 Hz, log=1 Hz)");
     TickType_t last_wake = xTaskGetTickCount();
+    uint32_t iter = 0;
     while (1) {
+        float v_5vsb = 0.0f, i_5vsb = 0.0f, v_12v = 0.0f, v_5v = 0.0f, v_3v3 = 0.0f, temp_c = 0.0f;
+        bool ok_5vsb = false, ok_12v = false, ok_5v = false, ok_3v3 = false, ok_temp = false;
+
         if (s_ina226_5vsb != NULL) {
-            float v_5vsb = 0.0f, i_5vsb = 0.0f;
-            int32_t shunt_uv = 0;
+            ok_5vsb = (ina226_read_bus_voltage(s_ina226_5vsb, &v_5vsb) == ESP_OK &&
+                       ina226_read_current(s_ina226_5vsb, &i_5vsb) == ESP_OK);
+        }
+        ok_12v  = (cec_adc_read(&s_rail_12v, &v_12v) == ESP_OK);
+        ok_5v   = (cec_adc_read(&s_rail_5v,  &v_5v)  == ESP_OK);
+        ok_3v3  = (cec_adc_read(&s_rail_3v3, &v_3v3) == ESP_OK);
+        ok_temp = (thermistor_read_celsius(&s_ntc, &temp_c) == ESP_OK);
 
-            err = ina226_read_bus_voltage(s_ina226_5vsb, &v_5vsb);
-            if (err != ESP_OK) {
-                ESP_LOGW(TAG, "bus_v read failed: %s", esp_err_to_name(err));
+        float i_5vsb_ema = ok_5vsb ? ema_update(&s_i_5vsb_ema, i_5vsb) : 0.0f;
+        float v_12v_ema  = ok_12v  ? ema_update(&s_v_12v_ema,  v_12v)  : 0.0f;
+        float v_5v_ema   = ok_5v   ? ema_update(&s_v_5v_ema,   v_5v)   : 0.0f;
+        float v_3v3_ema  = ok_3v3  ? ema_update(&s_v_3v3_ema,  v_3v3)  : 0.0f;
+        float temp_ema   = ok_temp ? ema_update(&s_temp_ema,   temp_c) : 0.0f;
+
+        if (iter % TELEPLOT_DIVIDER == 0) {
+            if (ok_5vsb) {
+                teleplot_emit("v_5vsb",     v_5vsb);
+                teleplot_emit("i_5vsb_raw", i_5vsb);
+                teleplot_emit("i_5vsb_ema", i_5vsb_ema);
             }
-            err = ina226_read_current(s_ina226_5vsb, &i_5vsb);
-            if (err != ESP_OK) {
-                ESP_LOGW(TAG, "current read failed: %s", esp_err_to_name(err));
-            }
-            err = ina226_read_shunt_microvolts(s_ina226_5vsb, &shunt_uv);
-            if (err != ESP_OK) {
-                ESP_LOGW(TAG, "shunt_uv read failed: %s", esp_err_to_name(err));
-            }
-
-            float i_5vsb_ema = ema_update(&s_i_5vsb_ema, i_5vsb);
-
-            teleplot_emit("v_5vsb", v_5vsb);
-            teleplot_emit("i_5vsb_raw", i_5vsb);
-            teleplot_emit("i_5vsb_ema", i_5vsb_ema);
-
-            ESP_LOGI(TAG, "5VSB: V=%.3f V, I=%.4f A (ema=%.4f), shunt=%" PRId32 " uV (P=%.4f W)",
-                     v_5vsb, i_5vsb, i_5vsb_ema, shunt_uv, v_5vsb * i_5vsb);
+            if (ok_12v) { teleplot_emit("v_12v", v_12v); teleplot_emit("v_12v_ema", v_12v_ema); }
+            if (ok_5v)  { teleplot_emit("v_5v",  v_5v);  teleplot_emit("v_5v_ema",  v_5v_ema);  }
+            if (ok_3v3) { teleplot_emit("v_3v3", v_3v3); teleplot_emit("v_3v3_ema", v_3v3_ema); }
+            if (ok_temp){ teleplot_emit("temp_c", temp_c); teleplot_emit("temp_c_ema", temp_ema); }
         }
 
-        float v_12v = 0.0f, v_5v = 0.0f, v_3v3 = 0.0f;
-        if (cec_adc_read(&s_rail_12v, &v_12v) == ESP_OK) {
-            float ema = ema_update(&s_v_12v_ema, v_12v);
-            teleplot_emit("v_12v", v_12v);
-            teleplot_emit("v_12v_ema", ema);
-        } else {
-            ESP_LOGW(TAG, "v_12v read failed");
-        }
-        if (cec_adc_read(&s_rail_5v, &v_5v) == ESP_OK) {
-            float ema = ema_update(&s_v_5v_ema, v_5v);
-            teleplot_emit("v_5v", v_5v);
-            teleplot_emit("v_5v_ema", ema);
-        } else {
-            ESP_LOGW(TAG, "v_5v read failed");
-        }
-        if (cec_adc_read(&s_rail_3v3, &v_3v3) == ESP_OK) {
-            float ema = ema_update(&s_v_3v3_ema, v_3v3);
-            teleplot_emit("v_3v3", v_3v3);
-            teleplot_emit("v_3v3_ema", ema);
-        } else {
-            ESP_LOGW(TAG, "v_3v3 read failed");
+        if (iter % LOG_DIVIDER == 0) {
+            ESP_LOGI(TAG, "rails: 12V=%.3f 5V=%.3f 3V3=%.3f 5VSB=%.3f V | "
+                          "I_5VSB=%.4f A | T=%.1f C",
+                     v_12v_ema, v_5v_ema, v_3v3_ema, v_5vsb,
+                     i_5vsb_ema, temp_ema);
         }
 
-        ESP_LOGI(TAG, "rails: 12V=%.3f V, 5V=%.3f V, 3.3V=%.3f V",
-                 v_12v, v_5v, v_3v3);
-
-        /* 5 Hz */
-        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(200));
+        iter++;
+        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(SAMPLE_PERIOD_MS));
     }
 }

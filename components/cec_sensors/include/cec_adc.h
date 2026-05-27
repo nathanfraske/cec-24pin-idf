@@ -39,9 +39,17 @@ esp_err_t cec_adc_init(void);
 
 /*
  * Configure a single ADC1 channel. Must be called once per channel before
- * cec_adc_read.
+ * cec_adc_read or cec_adc_read_mv.
  */
 esp_err_t cec_adc_setup_channel(adc_channel_t channel);
+
+/*
+ * Read the calibrated pin voltage in millivolts, averaged over `samples`
+ * raw conversions. Lower-level than cec_adc_read; used by sensor drivers
+ * (thermistor, ACS712) whose post-processing isn't a simple linear
+ * rail-divider scale.
+ */
+esp_err_t cec_adc_read_mv(adc_channel_t channel, int samples, int *out_mv);
 
 /*
  * Read a rail. Averages `rail->samples` raw conversions, applies the

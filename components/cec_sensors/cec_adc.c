@@ -53,27 +53,37 @@ esp_err_t cec_adc_setup_channel(adc_channel_t channel)
     return adc_oneshot_config_channel(s_unit, channel, &cfg);
 }
 
-esp_err_t cec_adc_read(const cec_adc_rail_t *rail, float *out_volts)
+esp_err_t cec_adc_read_mv(adc_channel_t channel, int samples, int *out_mv)
 {
     if (!s_inited) {
         return ESP_ERR_INVALID_STATE;
     }
-    if (rail == NULL || out_volts == NULL || rail->samples < 1) {
+    if (out_mv == NULL || samples < 1) {
         return ESP_ERR_INVALID_ARG;
     }
 
     int32_t sum_mv = 0;
-    for (int i = 0; i < rail->samples; i++) {
+    for (int i = 0; i < samples; i++) {
         int raw = 0;
-        ESP_RETURN_ON_ERROR(adc_oneshot_read(s_unit, rail->channel, &raw),
-                            TAG, "adc_oneshot_read ch=%d", (int)rail->channel);
+        ESP_RETURN_ON_ERROR(adc_oneshot_read(s_unit, channel, &raw),
+                            TAG, "adc_oneshot_read ch=%d", (int)channel);
         int mv = 0;
         ESP_RETURN_ON_ERROR(adc_cali_raw_to_voltage(s_cali, raw, &mv),
                             TAG, "adc_cali_raw_to_voltage");
         sum_mv += mv;
     }
+    *out_mv = (int)(sum_mv / samples);
+    return ESP_OK;
+}
 
-    float v_pin = ((float)sum_mv / (float)rail->samples) / 1000.0f;
-    *out_volts = v_pin * rail->scale * rail->trim;
+esp_err_t cec_adc_read(const cec_adc_rail_t *rail, float *out_volts)
+{
+    if (rail == NULL || out_volts == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    int mv = 0;
+    ESP_RETURN_ON_ERROR(cec_adc_read_mv(rail->channel, rail->samples, &mv),
+                        TAG, "cec_adc_read_mv");
+    *out_volts = (mv / 1000.0f) * rail->scale * rail->trim;
     return ESP_OK;
 }
