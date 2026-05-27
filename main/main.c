@@ -23,6 +23,8 @@
 #include "driver/i2c_master.h"
 
 #include "ina226.h"
+#include "cec_filters.h"
+#include "cec_teleplot.h"
 
 static const char *TAG = "cec_main";
 
@@ -34,11 +36,19 @@ static const char *TAG = "cec_main";
 /* Per-rail trim factors carried forward from v0.5.9 (hardware-specific) */
 #define TRIM_5VSB         0.9901f
 
+/* EMA smoothing on the 5VSB current. At the 5 Hz sample rate below this
+ * gives a time constant of roughly 2 seconds — slow enough to make the
+ * raw-vs-filtered traces visibly different in TelePlot. */
+#define EMA_ALPHA_I_5VSB  0.1f
+
 /* I2C bus handle (shared across components later) */
 static i2c_master_bus_handle_t s_i2c_bus = NULL;
 
 /* INA226 instances. For now only 5VSB. Will add 12V/5V/3V3 after PCB rev. */
 static ina226_handle_t s_ina226_5vsb = NULL;
+
+/* Filter state */
+static ema_t s_i_5vsb_ema;
 
 static void init_i2c_bus(void)
 {
@@ -105,7 +115,10 @@ void app_main(void)
         ESP_LOGW(TAG, "Continuing without INA226 readings");
     }
 
-    /* Main loop: read INA226 at 5 Hz and log */
+    ema_init(&s_i_5vsb_ema, EMA_ALPHA_I_5VSB);
+
+    /* Main loop: read INA226 at 5 Hz, log a summary and emit TelePlot
+     * series ('v_5vsb', 'i_5vsb_raw', 'i_5vsb_ema') on every iteration. */
     ESP_LOGI(TAG, "Entering main loop");
     TickType_t last_wake = xTaskGetTickCount();
     while (1) {
@@ -126,8 +139,14 @@ void app_main(void)
                 ESP_LOGW(TAG, "shunt_uv read failed: %s", esp_err_to_name(err));
             }
 
-            ESP_LOGI(TAG, "5VSB: V=%.3f V, I=%.4f A, shunt=%" PRId32 " uV (P=%.4f W)",
-                     v_5vsb, i_5vsb, shunt_uv, v_5vsb * i_5vsb);
+            float i_5vsb_ema = ema_update(&s_i_5vsb_ema, i_5vsb);
+
+            teleplot_emit("v_5vsb", v_5vsb);
+            teleplot_emit("i_5vsb_raw", i_5vsb);
+            teleplot_emit("i_5vsb_ema", i_5vsb_ema);
+
+            ESP_LOGI(TAG, "5VSB: V=%.3f V, I=%.4f A (ema=%.4f), shunt=%" PRId32 " uV (P=%.4f W)",
+                     v_5vsb, i_5vsb, i_5vsb_ema, shunt_uv, v_5vsb * i_5vsb);
         }
 
         /* 5 Hz */
