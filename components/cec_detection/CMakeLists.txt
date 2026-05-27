@@ -2,6 +2,7 @@ idf_component_register(
     SRCS
         "cec_filters.c"
         "cec_state.c"
+        "cec_layer1.c"
         # Source files added during porting:
         # "swing_detector.c"
         # "adaptive_transient.c"

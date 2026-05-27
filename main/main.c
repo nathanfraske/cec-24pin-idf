@@ -31,6 +31,7 @@
 #include "acs712.h"
 #include "cec_filters.h"
 #include "cec_state.h"
+#include "cec_layer1.h"
 #include "cec_teleplot.h"
 
 static const char *TAG = "cec_main";
@@ -142,6 +143,15 @@ static ema_t s_temp_ema;
 static cec_state_t s_state = CEC_STATE_OFF;
 static int64_t s_state_entered_us = 0;
 
+/* Layer 1 static-threshold detectors per rail. Bands carry forward from
+ * v0.5.9: 5%/10% on main rails, 10%/20% on 5VSB. */
+#define L1_CRIT_CONSECUTIVE 3
+static cec_layer1_detector_t s_l1_12v, s_l1_5v, s_l1_3v3, s_l1_5vsb;
+static cec_severity_t s_last_sev_12v  = CEC_SEV_NONE;
+static cec_severity_t s_last_sev_5v   = CEC_SEV_NONE;
+static cec_severity_t s_last_sev_3v3  = CEC_SEV_NONE;
+static cec_severity_t s_last_sev_5vsb = CEC_SEV_NONE;
+
 static void init_i2c_bus(void)
 {
     i2c_master_bus_config_t bus_cfg = {
@@ -180,6 +190,39 @@ static esp_err_t init_ina226_5vsb(void)
     cfg.current_trim = 1.0f;      /* No current trim on 5VSB */
 
     return ina226_create(&cfg, &s_ina226_5vsb);
+}
+
+static void init_layer1(void)
+{
+    static const cec_rail_spec_t SPEC_12V  = { 12.0f, 0.05f, 0.10f };
+    static const cec_rail_spec_t SPEC_5V   = {  5.0f, 0.05f, 0.10f };
+    static const cec_rail_spec_t SPEC_3V3  = {  3.3f, 0.05f, 0.10f };
+    static const cec_rail_spec_t SPEC_5VSB = {  5.0f, 0.10f, 0.20f };
+    cec_layer1_init(&s_l1_12v,  &SPEC_12V,  L1_CRIT_CONSECUTIVE);
+    cec_layer1_init(&s_l1_5v,   &SPEC_5V,   L1_CRIT_CONSECUTIVE);
+    cec_layer1_init(&s_l1_3v3,  &SPEC_3V3,  L1_CRIT_CONSECUTIVE);
+    cec_layer1_init(&s_l1_5vsb, &SPEC_5VSB, L1_CRIT_CONSECUTIVE);
+}
+
+/* Update one rail's Layer 1 detector and log on severity transitions.
+ * Returns the new sustained severity so the caller can also publish it
+ * (e.g. on a TelePlot trace). */
+static cec_severity_t layer1_step(const char *rail_name,
+                                  cec_layer1_detector_t *d,
+                                  cec_severity_t *last_sev,
+                                  float v_rail)
+{
+    cec_severity_t sev = cec_layer1_update(d, v_rail);
+    if (sev != *last_sev) {
+        if (sev != CEC_SEV_NONE) {
+            ESP_LOGW(TAG, "L1: %s %s (v=%.3f, nominal=%.2f)",
+                     rail_name, cec_severity_name(sev), v_rail, d->spec.nominal);
+        } else {
+            ESP_LOGI(TAG, "L1: %s recovered (v=%.3f)", rail_name, v_rail);
+        }
+        *last_sev = sev;
+    }
+    return sev;
 }
 
 static void log_hardware_info(void)
@@ -234,6 +277,8 @@ void app_main(void)
     ema_init(&s_i_5v_ema,   EMA_ALPHA_FAST);
     ema_init(&s_i_3v3_ema,  EMA_ALPHA_FAST);
     ema_init(&s_temp_ema,   EMA_ALPHA_FAST);
+
+    init_layer1();
 
     /* Sample at 50 Hz, emit TelePlot at 10 Hz, log an INFO summary at 1 Hz.
      * Read failures don't get spammed per-iteration; the divided cadence
@@ -291,6 +336,27 @@ void app_main(void)
             s_state_entered_us = now_us;
         }
 
+        /* Layer 1 main rails: only check in IDLE/ACTIVE/PEAK. During
+         * OFF/STANDBY the rails are 0 V or ramping, and the brief
+         * mid-range values during power-up would otherwise sustain a
+         * spurious CRITICAL for several iterations. 5VSB is on whenever
+         * the PSU is plugged in, so its detector runs unconditionally
+         * and relies on the RAIL_OFF check to handle the actually-off
+         * state. */
+        cec_severity_t sev_12v = CEC_SEV_NONE;
+        cec_severity_t sev_5v  = CEC_SEV_NONE;
+        cec_severity_t sev_3v3 = CEC_SEV_NONE;
+        if (s_state == CEC_STATE_IDLE || s_state == CEC_STATE_ACTIVE || s_state == CEC_STATE_PEAK) {
+            sev_12v = layer1_step("12V", &s_l1_12v, &s_last_sev_12v, v_12v_ema);
+            sev_5v  = layer1_step("5V",  &s_l1_5v,  &s_last_sev_5v,  v_5v_ema);
+            sev_3v3 = layer1_step("3V3", &s_l1_3v3, &s_last_sev_3v3, v_3v3_ema);
+        } else {
+            cec_layer1_reset(&s_l1_12v); s_last_sev_12v = CEC_SEV_NONE;
+            cec_layer1_reset(&s_l1_5v);  s_last_sev_5v  = CEC_SEV_NONE;
+            cec_layer1_reset(&s_l1_3v3); s_last_sev_3v3 = CEC_SEV_NONE;
+        }
+        cec_severity_t sev_5vsb = layer1_step("5VSB", &s_l1_5vsb, &s_last_sev_5vsb, v_5vsb);
+
         if (iter % TELEPLOT_DIVIDER == 0) {
             if (ok_5vsb) {
                 teleplot_emit("v_5vsb",     v_5vsb);
@@ -306,6 +372,10 @@ void app_main(void)
             if (ok_temp)  { teleplot_emit("temp_c", temp_c); teleplot_emit("temp_c_ema", temp_ema); }
             teleplot_emit("p_total", p_total);
             teleplot_emit("state",   (float)s_state);
+            teleplot_emit("sev_12v",  (float)sev_12v);
+            teleplot_emit("sev_5v",   (float)sev_5v);
+            teleplot_emit("sev_3v3",  (float)sev_3v3);
+            teleplot_emit("sev_5vsb", (float)sev_5vsb);
         }
 
         if (iter % LOG_DIVIDER == 0) {
