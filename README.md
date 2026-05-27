@@ -58,8 +58,9 @@ Tracking the port progress from Arduino-ESP32 v0.5.9 to ESP-IDF:
 | Teleplot output via USB CDC | Done |
 | State classifier | Done |
 | Layer 1 static thresholds | Done |
-| Layer 2 (adaptive transient) + Layer 3 (Z-score anomaly) | Pending |
-| Burst capture engine | Pending |
+| Layer 2 (adaptive transient) | Done |
+| Layer 3 (Z-score anomaly) | Done (NVS-backed profiles pending) |
+| Burst capture engine | Done (non-blocking, oneshot ADC; DMA path pending) |
 | NVS profile storage | Pending |
 | Serial command interface | Pending |
 

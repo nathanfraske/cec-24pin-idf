@@ -28,3 +28,15 @@ esp_err_t acs712_read_amps(const acs712_t *s, float *out_a)
     *out_a = (v_acs - s->zero_point_v) / s->sensitivity_v_per_a;
     return ESP_OK;
 }
+
+esp_err_t acs712_measure_zero_point(const acs712_t *s, int samples, float *out_v)
+{
+    if (s == NULL || out_v == NULL || samples < 1) return ESP_ERR_INVALID_ARG;
+
+    int mv = 0;
+    ESP_RETURN_ON_ERROR(cec_adc_read_mv(s->channel, samples, &mv),
+                        TAG, "cec_adc_read_mv");
+
+    *out_v = (mv / 1000.0f) * s->divider_scale;
+    return ESP_OK;
+}

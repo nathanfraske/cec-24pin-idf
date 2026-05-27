@@ -48,6 +48,18 @@ esp_err_t acs712_setup(const acs712_t *s);
  */
 esp_err_t acs712_read_amps(const acs712_t *s, float *out_a);
 
+/*
+ * Measure the sensor's no-load output, averaged over `samples` raw reads.
+ * Caller is responsible for guaranteeing the rail is unloaded — the
+ * routine just averages whatever it sees. Writes the post-divider voltage
+ * (i.e. the value that should be written back into `zero_point_v`) into
+ * out_v.
+ *
+ * Useful for diagnostics ("what does this sensor actually read at rest?")
+ * and for the future serial-command / NVS-backed calibration path.
+ */
+esp_err_t acs712_measure_zero_point(const acs712_t *s, int samples, float *out_v);
+
 #ifdef __cplusplus
 }
 #endif

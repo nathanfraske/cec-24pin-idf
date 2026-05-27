@@ -15,6 +15,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <inttypes.h>
+#include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -32,6 +33,9 @@
 #include "cec_filters.h"
 #include "cec_state.h"
 #include "cec_layer1.h"
+#include "cec_layer2.h"
+#include "cec_layer3.h"
+#include "cec_capture.h"
 #include "cec_teleplot.h"
 
 static const char *TAG = "cec_main";
@@ -67,9 +71,18 @@ static const char *TAG = "cec_main";
 #define ACS712_DIVIDER       ((20000.0f + 30000.0f) / 30000.0f)
 #define ACS712_30A_SENS      0.066f
 #define ACS712_20A_SENS      0.100f
-/* No-load output at the post-divider voltage. Nominal Vcc/2 ~ 2.20 V;
- * needs per-unit calibration once the serial-command path lands. */
-#define ACS712_ZERO_DEFAULT  2.20f
+/* Per-rail no-load output (post-divider voltage). Nominal Vcc/2 = 2.20 V
+ * but the part-to-part variation is several tens of mV (hundreds of mA
+ * at these sensitivities), so each rail gets its own constant for hand-
+ * tuning. The boot-time diagnostic logs the measured no-load output —
+ * with the PSU disconnected at first boot, copy those values here. Full
+ * runtime calibration lands with the serial-command + NVS path.
+ *
+ * Values below are the per-unit no-load measurements captured against
+ * this board with the PSU disconnected. */
+#define ACS712_ZERO_12V      2.4483f
+#define ACS712_ZERO_5V       2.1967f
+#define ACS712_ZERO_3V3      2.2117f
 
 /* Loop cadence. Sample at 50 Hz to match v0.5.9; emit TelePlot at 10 Hz
  * (every 5th iteration); log an INFO summary at 1 Hz (every 50th). */
@@ -118,19 +131,50 @@ static const acs712_t s_acs_12v = {
     .channel = ADC_CH_I_12V, .samples = 4,
     .divider_scale = ACS712_DIVIDER,
     .sensitivity_v_per_a = ACS712_30A_SENS,
-    .zero_point_v = ACS712_ZERO_DEFAULT,
+    .zero_point_v = ACS712_ZERO_12V,
 };
 static const acs712_t s_acs_5v = {
     .channel = ADC_CH_I_5V,  .samples = 4,
     .divider_scale = ACS712_DIVIDER,
     .sensitivity_v_per_a = ACS712_20A_SENS,
-    .zero_point_v = ACS712_ZERO_DEFAULT,
+    .zero_point_v = ACS712_ZERO_5V,
 };
 static const acs712_t s_acs_3v3 = {
     .channel = ADC_CH_I_3V3, .samples = 4,
     .divider_scale = ACS712_DIVIDER,
     .sensitivity_v_per_a = ACS712_20A_SENS,
-    .zero_point_v = ACS712_ZERO_DEFAULT,
+    .zero_point_v = ACS712_ZERO_3V3,
+};
+
+/* HS-rate configs (samples=1) used by the burst capture engine to keep
+ * each 1 kHz iteration well under the 1 ms budget. Scale/trim/zero match
+ * the main-loop configs above. */
+static const cec_adc_rail_t s_hs_rail_12v = {
+    .channel = ADC_CH_V_12V, .samples = 1, .scale = SCALE_12V, .trim = TRIM_12V,
+};
+static const cec_adc_rail_t s_hs_rail_5v = {
+    .channel = ADC_CH_V_5V,  .samples = 1, .scale = SCALE_5V,  .trim = TRIM_5V,
+};
+static const cec_adc_rail_t s_hs_rail_3v3 = {
+    .channel = ADC_CH_V_3V3, .samples = 1, .scale = SCALE_3V3, .trim = TRIM_3V3,
+};
+static const acs712_t s_hs_acs_12v = {
+    .channel = ADC_CH_I_12V, .samples = 1,
+    .divider_scale = ACS712_DIVIDER,
+    .sensitivity_v_per_a = ACS712_30A_SENS,
+    .zero_point_v = ACS712_ZERO_12V,
+};
+static const acs712_t s_hs_acs_5v = {
+    .channel = ADC_CH_I_5V,  .samples = 1,
+    .divider_scale = ACS712_DIVIDER,
+    .sensitivity_v_per_a = ACS712_20A_SENS,
+    .zero_point_v = ACS712_ZERO_5V,
+};
+static const acs712_t s_hs_acs_3v3 = {
+    .channel = ADC_CH_I_3V3, .samples = 1,
+    .divider_scale = ACS712_DIVIDER,
+    .sensitivity_v_per_a = ACS712_20A_SENS,
+    .zero_point_v = ACS712_ZERO_3V3,
 };
 
 /* Filter state */
@@ -146,11 +190,47 @@ static int64_t s_state_entered_us = 0;
 /* Layer 1 static-threshold detectors per rail. Bands carry forward from
  * v0.5.9: 5%/10% on main rails, 10%/20% on 5VSB. */
 #define L1_CRIT_CONSECUTIVE 3
+
+/* Mask Layer 1 for this long after every state transition. Covers the
+ * PSU inrush (most visibly on 5VSB OFF -> STANDBY ramp, where the rail
+ * passes through 1..5 V on its way up and would otherwise sustain
+ * CRITICAL for the consecutive-sample window). 500 ms is loose enough
+ * for typical PSU ramp times and tight enough not to miss real faults. */
+#define LAYER1_SETTLE_US  (500LL * 1000)
+
 static cec_layer1_detector_t s_l1_12v, s_l1_5v, s_l1_3v3, s_l1_5vsb;
 static cec_severity_t s_last_sev_12v  = CEC_SEV_NONE;
 static cec_severity_t s_last_sev_5v   = CEC_SEV_NONE;
 static cec_severity_t s_last_sev_3v3  = CEC_SEV_NONE;
 static cec_severity_t s_last_sev_5vsb = CEC_SEV_NONE;
+
+/* Layer 2 adaptive transient detectors. Per-rail min-thresholds and
+ * k_sigma carry forward from v0.5.9. The fire condition is
+ * |instant - ema| > max(min, k*std) for 3 consecutive samples. */
+#define LAYER2_K_SIGMA       5.0f
+#define LAYER2_CONSECUTIVE   3
+#define L2_MIN_V_12V         0.50f
+#define L2_MIN_V_5V          0.20f
+#define L2_MIN_V_3V3         0.15f
+#define L2_MIN_V_5VSB        0.30f
+#define L2_MIN_I_12V         1.00f
+#define L2_MIN_I_5V          0.50f
+#define L2_MIN_I_3V3         0.30f
+static cec_layer2_detector_t s_l2_v_12v, s_l2_v_5v, s_l2_v_3v3, s_l2_v_5vsb;
+static cec_layer2_detector_t s_l2_i_12v, s_l2_i_5v, s_l2_i_3v3;
+
+/* Layer 3 per-(state, rail) running profile. Z-score threshold 4.0
+ * (v0.5.9 default). Adapt rate 0.0005 gives an effective window of
+ * roughly 2000 samples (40 s at 50 Hz) once the profile is warm. */
+#define LAYER3_Z_THRESHOLD   4.0f
+#define PROFILE_ADAPT_RATE   0.0005f
+typedef enum {
+    PROF_V_12V = 0, PROF_V_5V,  PROF_V_3V3,  PROF_V_5VSB,
+    PROF_I_12V,     PROF_I_5V,  PROF_I_3V3,  PROF_I_5VSB,
+    PROF_TEMP,      PROF_COUNT
+} prof_idx_t;
+static cec_rail_profile_t s_profiles[CEC_STATE_COUNT][PROF_COUNT];
+static bool s_z_above_last = false;
 
 static void init_i2c_bus(void)
 {
@@ -204,16 +284,69 @@ static void init_layer1(void)
     cec_layer1_init(&s_l1_5vsb, &SPEC_5VSB, L1_CRIT_CONSECUTIVE);
 }
 
-/* Update one rail's Layer 1 detector and log on severity transitions.
- * Returns the new sustained severity so the caller can also publish it
- * (e.g. on a TelePlot trace). */
-static cec_severity_t layer1_step(const char *rail_name,
-                                  cec_layer1_detector_t *d,
-                                  cec_severity_t *last_sev,
-                                  float v_rail)
+static void init_layer2(void)
 {
+    cec_layer2_init(&s_l2_v_12v,  L2_MIN_V_12V,  LAYER2_K_SIGMA, LAYER2_CONSECUTIVE);
+    cec_layer2_init(&s_l2_v_5v,   L2_MIN_V_5V,   LAYER2_K_SIGMA, LAYER2_CONSECUTIVE);
+    cec_layer2_init(&s_l2_v_3v3,  L2_MIN_V_3V3,  LAYER2_K_SIGMA, LAYER2_CONSECUTIVE);
+    cec_layer2_init(&s_l2_v_5vsb, L2_MIN_V_5VSB, LAYER2_K_SIGMA, LAYER2_CONSECUTIVE);
+    cec_layer2_init(&s_l2_i_12v,  L2_MIN_I_12V,  LAYER2_K_SIGMA, LAYER2_CONSECUTIVE);
+    cec_layer2_init(&s_l2_i_5v,   L2_MIN_I_5V,   LAYER2_K_SIGMA, LAYER2_CONSECUTIVE);
+    cec_layer2_init(&s_l2_i_3v3,  L2_MIN_I_3V3,  LAYER2_K_SIGMA, LAYER2_CONSECUTIVE);
+}
+
+static void init_layer3_profiles(void)
+{
+    for (int s = 0; s < CEC_STATE_COUNT; s++) {
+        for (int r = 0; r < PROF_COUNT; r++) {
+            cec_rail_profile_init(&s_profiles[s][r]);
+        }
+    }
+}
+
+/* Clear Layer 2 consecutive-fire counters on a "state up" transition so
+ * a pending fire from STANDBY ramp values doesn't survive into IDLE. */
+static void reset_layer2_counters(void)
+{
+    cec_layer2_reset(&s_l2_v_12v);
+    cec_layer2_reset(&s_l2_v_5v);
+    cec_layer2_reset(&s_l2_v_3v3);
+    cec_layer2_reset(&s_l2_v_5vsb);
+    cec_layer2_reset(&s_l2_i_12v);
+    cec_layer2_reset(&s_l2_i_5v);
+    cec_layer2_reset(&s_l2_i_3v3);
+}
+
+/* Re-prime EMAs to the next sample on transitions UP into the
+ * main-rails-on regime. Without this, the EMAs would carry their
+ * pre-transition (near-zero) values into the new state and produce
+ * misleading instant-vs-EMA deviations until they catch up. v0.5.9
+ * does the same in reset_filters_on_state_up(). */
+static void reset_emas_on_state_up(void)
+{
+    ema_reset(&s_v_5vsb_ema); ema_reset(&s_i_5vsb_ema);
+    ema_reset(&s_v_12v_ema);  ema_reset(&s_v_5v_ema);  ema_reset(&s_v_3v3_ema);
+    ema_reset(&s_i_12v_ema);  ema_reset(&s_i_5v_ema);  ema_reset(&s_i_3v3_ema);
+    ema_reset(&s_temp_ema);
+}
+
+typedef struct {
+    cec_severity_t sev;
+    bool entered_critical;   /* true on the iteration where sev steps to CRITICAL */
+} layer1_step_result_t;
+
+/* Update one rail's Layer 1 detector, log on severity transitions, and
+ * report whether this is the iteration on which the rail just stepped
+ * into CRITICAL — the caller uses that to fire a burst trigger exactly
+ * once per fault entry. */
+static layer1_step_result_t layer1_step(const char *rail_name,
+                                        cec_layer1_detector_t *d,
+                                        cec_severity_t *last_sev,
+                                        float v_rail)
+{
+    cec_severity_t prev = *last_sev;
     cec_severity_t sev = cec_layer1_update(d, v_rail);
-    if (sev != *last_sev) {
+    if (sev != prev) {
         if (sev != CEC_SEV_NONE) {
             ESP_LOGW(TAG, "L1: %s %s (v=%.3f, nominal=%.2f)",
                      rail_name, cec_severity_name(sev), v_rail, d->spec.nominal);
@@ -222,7 +355,58 @@ static cec_severity_t layer1_step(const char *rail_name,
         }
         *last_sev = sev;
     }
-    return sev;
+    return (layer1_step_result_t){
+        .sev = sev,
+        .entered_critical = (prev != CEC_SEV_CRITICAL && sev == CEC_SEV_CRITICAL),
+    };
+}
+
+/* Sample each ACS712's no-load output and log what it reads, along with
+ * the equivalent offset current vs. the constants currently compiled in.
+ * Run once at boot before the main loop starts feeding the sensors.
+ * Lets you copy the measured no-load voltages directly into
+ * ACS712_ZERO_{12V,5V,3V3} for a per-unit-tuned offset until the proper
+ * serial-command / NVS calibration path lands. */
+static void log_acs712_zero_measurements(void)
+{
+    struct {
+        const char *name;
+        const acs712_t *cfg;
+        float compiled_zero;
+        float sens;
+    } rails[] = {
+        { "12V", &s_acs_12v, ACS712_ZERO_12V, ACS712_30A_SENS },
+        { "5V",  &s_acs_5v,  ACS712_ZERO_5V,  ACS712_20A_SENS },
+        { "3V3", &s_acs_3v3, ACS712_ZERO_3V3, ACS712_20A_SENS },
+    };
+    ESP_LOGI(TAG, "ACS712 no-load diagnostic (200-sample average):");
+    for (size_t i = 0; i < sizeof(rails) / sizeof(rails[0]); i++) {
+        float measured = 0.0f;
+        esp_err_t err = acs712_measure_zero_point(rails[i].cfg, 200, &measured);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "  %s: measure failed (%s)", rails[i].name, esp_err_to_name(err));
+            continue;
+        }
+        float implied_a = (measured - rails[i].compiled_zero) / rails[i].sens;
+        ESP_LOGI(TAG, "  %s: measured=%.4f V, compiled=%.4f V "
+                      "=> implied no-load current = %+.3f A",
+                 rails[i].name, measured, rails[i].compiled_zero, implied_a);
+    }
+    ESP_LOGI(TAG, "If \"implied no-load current\" is non-zero with PSU "
+                  "disconnected, paste the measured V into ACS712_ZERO_<rail>.");
+}
+
+/* Burst capture HS sample callback. Runs at 1 kHz on the cec_hs_cap task
+ * (Core 1) — must stay well under 1 ms. Six oneshot ADC reads + scaling
+ * comfortably fit. */
+static void hs_sample_fn(cec_capture_hs_sample_t *out)
+{
+    cec_adc_read(&s_hs_rail_12v, &out->v_12v);
+    cec_adc_read(&s_hs_rail_5v,  &out->v_5v);
+    cec_adc_read(&s_hs_rail_3v3, &out->v_3v3);
+    acs712_read_amps(&s_hs_acs_12v, &out->i_12v);
+    acs712_read_amps(&s_hs_acs_5v,  &out->i_5v);
+    acs712_read_amps(&s_hs_acs_3v3, &out->i_3v3);
 }
 
 static void log_hardware_info(void)
@@ -280,6 +464,16 @@ void app_main(void)
     ema_init(&s_temp_ema,   EMA_ALPHA_FAST);
 
     init_layer1();
+    init_layer2();
+    init_layer3_profiles();
+
+    log_acs712_zero_measurements();
+
+    err = cec_capture_init(hs_sample_fn);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "cec_capture_init failed: %s", esp_err_to_name(err));
+        ESP_LOGW(TAG, "Continuing without burst capture");
+    }
 
     /* Sample at 50 Hz, emit TelePlot at 10 Hz, log an INFO summary at 1 Hz.
      * Read failures don't get spammed per-iteration; the divided cadence
@@ -334,51 +528,179 @@ void app_main(void)
             ESP_LOGI(TAG, "state: %s -> %s (dwell=%lld ms, p_total=%.1f W)",
                      cec_state_name(s_state), cec_state_name(next_state),
                      (long long)dwell_ms, p_total);
+            /* Transition UP from below IDLE: rails were 0 V or ramping,
+             * the EMAs / Layer-2 variance estimators carry pre-transition
+             * state, and Layer-2 counters might be mid-accumulating from
+             * the ramp. Reset them so the new state starts clean. Matches
+             * v0.5.9 reset_filters_on_state_up. */
+            if (next_state >= CEC_STATE_IDLE && s_state < CEC_STATE_IDLE) {
+                reset_emas_on_state_up();
+                reset_layer2_counters();
+                s_z_above_last = false;
+            }
             s_state = next_state;
             s_state_entered_us = now_us;
         }
 
-        /* Layer 1 main rails: only check in IDLE/ACTIVE/PEAK. During
-         * OFF/STANDBY the rails are 0 V or ramping, and the brief
-         * mid-range values during power-up would otherwise sustain a
-         * spurious CRITICAL for several iterations. 5VSB is on whenever
-         * the PSU is plugged in, so its detector runs unconditionally
-         * and relies on the RAIL_OFF check to handle the actually-off
-         * state. */
+        /* Layer 1 gating:
+         *   - Main rails (12V/5V/3V3) only check in IDLE/ACTIVE/PEAK,
+         *     since OFF/STANDBY has them at 0 V and the ramp passes
+         *     through out-of-band values.
+         *   - 5VSB checks any time the rail is supposed to be present
+         *     (everything except OFF).
+         *   - Both wait LAYER1_SETTLE_US after every state transition
+         *     so the PSU's inrush ramp doesn't trip a false CRITICAL.
+         *     Detectors are reset during the settle window so the
+         *     consecutive-sample counter doesn't accumulate from the
+         *     ramp.
+         */
+        bool l1_settled = (esp_timer_get_time() - s_state_entered_us) > LAYER1_SETTLE_US;
+        bool main_rails_armed = l1_settled
+            && (s_state == CEC_STATE_IDLE || s_state == CEC_STATE_ACTIVE || s_state == CEC_STATE_PEAK);
+        bool sb_rail_armed = l1_settled && (s_state != CEC_STATE_OFF);
+
         cec_severity_t sev_12v = CEC_SEV_NONE;
         cec_severity_t sev_5v  = CEC_SEV_NONE;
         cec_severity_t sev_3v3 = CEC_SEV_NONE;
-        if (s_state == CEC_STATE_IDLE || s_state == CEC_STATE_ACTIVE || s_state == CEC_STATE_PEAK) {
-            sev_12v = layer1_step("12V", &s_l1_12v, &s_last_sev_12v, v_12v_ema);
-            sev_5v  = layer1_step("5V",  &s_l1_5v,  &s_last_sev_5v,  v_5v_ema);
-            sev_3v3 = layer1_step("3V3", &s_l1_3v3, &s_last_sev_3v3, v_3v3_ema);
+        cec_severity_t sev_5vsb = CEC_SEV_NONE;
+        bool any_entered_crit = false;
+
+        if (main_rails_armed) {
+            layer1_step_result_t r;
+            r = layer1_step("12V", &s_l1_12v, &s_last_sev_12v, v_12v_ema);
+            sev_12v = r.sev; any_entered_crit |= r.entered_critical;
+            r = layer1_step("5V",  &s_l1_5v,  &s_last_sev_5v,  v_5v_ema);
+            sev_5v  = r.sev; any_entered_crit |= r.entered_critical;
+            r = layer1_step("3V3", &s_l1_3v3, &s_last_sev_3v3, v_3v3_ema);
+            sev_3v3 = r.sev; any_entered_crit |= r.entered_critical;
         } else {
             cec_layer1_reset(&s_l1_12v); s_last_sev_12v = CEC_SEV_NONE;
             cec_layer1_reset(&s_l1_5v);  s_last_sev_5v  = CEC_SEV_NONE;
             cec_layer1_reset(&s_l1_3v3); s_last_sev_3v3 = CEC_SEV_NONE;
         }
-        cec_severity_t sev_5vsb = layer1_step("5VSB", &s_l1_5vsb, &s_last_sev_5vsb, v_5vsb_ema);
+        if (sb_rail_armed) {
+            layer1_step_result_t r5sb = layer1_step("5VSB", &s_l1_5vsb, &s_last_sev_5vsb, v_5vsb_ema);
+            sev_5vsb = r5sb.sev;
+            any_entered_crit |= r5sb.entered_critical;
+        } else {
+            cec_layer1_reset(&s_l1_5vsb); s_last_sev_5vsb = CEC_SEV_NONE;
+        }
+
+        if (any_entered_crit) {
+            esp_err_t terr = cec_capture_trigger(CEC_TRIG_STATIC_CRIT);
+            if (terr == ESP_OK) {
+                ESP_LOGW(TAG, "burst trigger: STATIC_CRIT");
+            } else if (terr == ESP_ERR_NOT_FINISHED) {
+                ESP_LOGW(TAG, "burst trigger: STATIC_CRIT skipped (capture busy)");
+            } else if (terr == ESP_ERR_INVALID_STATE) {
+                ESP_LOGW(TAG, "burst trigger: STATIC_CRIT skipped (cooldown)");
+            }
+        }
+
+        /* Layers 2 and 3 share the same gating as the Layer 1 main rails:
+         * only run when settled in IDLE/ACTIVE/PEAK. During OFF/STANDBY
+         * the main rails are zero and the comparisons aren't meaningful;
+         * the settle window covers EMA / variance-estimator convergence
+         * after a state-up transition. */
+        bool detection_armed = main_rails_armed;
+
+        bool l2_fired = false;
+        if (detection_armed) {
+            l2_fired |= cec_layer2_update(&s_l2_v_12v,  v_12v,  v_12v_ema);
+            l2_fired |= cec_layer2_update(&s_l2_v_5v,   v_5v,   v_5v_ema);
+            l2_fired |= cec_layer2_update(&s_l2_v_3v3,  v_3v3,  v_3v3_ema);
+            l2_fired |= cec_layer2_update(&s_l2_v_5vsb, v_5vsb, v_5vsb_ema);
+            l2_fired |= cec_layer2_update(&s_l2_i_12v,  i_12v,  i_12v_ema);
+            l2_fired |= cec_layer2_update(&s_l2_i_5v,   i_5v,   i_5v_ema);
+            l2_fired |= cec_layer2_update(&s_l2_i_3v3,  i_3v3,  i_3v3_ema);
+        } else {
+            reset_layer2_counters();
+        }
+        if (l2_fired) {
+            esp_err_t terr = cec_capture_trigger(CEC_TRIG_TRANSIENT);
+            if (terr == ESP_OK) {
+                ESP_LOGW(TAG, "burst trigger: TRANSIENT");
+            }
+            /* NOT_FINISHED / cooldown skips are silent for L2/L3 — they
+             * fire often enough that logging each skip would be noisy. */
+        }
+
+        /* Layer 3: update the current state's profiles, then compute
+         * the max |z| across the six main rails. Single-sample trigger
+         * gated on transition (z stayed below, now crossed above)
+         * so a sustained anomaly doesn't spam the trigger path. */
+        float z_max = 0.0f;
+        if (detection_armed) {
+            cec_rail_profile_t *prof = s_profiles[s_state];
+            cec_rail_profile_update(&prof[PROF_V_12V],  v_12v_ema,  PROFILE_ADAPT_RATE);
+            cec_rail_profile_update(&prof[PROF_V_5V],   v_5v_ema,   PROFILE_ADAPT_RATE);
+            cec_rail_profile_update(&prof[PROF_V_3V3],  v_3v3_ema,  PROFILE_ADAPT_RATE);
+            cec_rail_profile_update(&prof[PROF_V_5VSB], v_5vsb_ema, PROFILE_ADAPT_RATE);
+            cec_rail_profile_update(&prof[PROF_I_12V],  i_12v_ema,  PROFILE_ADAPT_RATE);
+            cec_rail_profile_update(&prof[PROF_I_5V],   i_5v_ema,   PROFILE_ADAPT_RATE);
+            cec_rail_profile_update(&prof[PROF_I_3V3],  i_3v3_ema,  PROFILE_ADAPT_RATE);
+            cec_rail_profile_update(&prof[PROF_I_5VSB], i_5vsb_ema, PROFILE_ADAPT_RATE);
+            cec_rail_profile_update(&prof[PROF_TEMP],   temp_ema,   PROFILE_ADAPT_RATE);
+
+            if (cec_rail_profile_is_warm(&prof[PROF_V_12V])) {
+                float z;
+                z = fabsf(cec_rail_profile_z_score(&prof[PROF_V_12V], v_12v_ema)); if (z > z_max) z_max = z;
+                z = fabsf(cec_rail_profile_z_score(&prof[PROF_V_5V],  v_5v_ema));  if (z > z_max) z_max = z;
+                z = fabsf(cec_rail_profile_z_score(&prof[PROF_V_3V3], v_3v3_ema)); if (z > z_max) z_max = z;
+                z = fabsf(cec_rail_profile_z_score(&prof[PROF_I_12V], i_12v_ema)); if (z > z_max) z_max = z;
+                z = fabsf(cec_rail_profile_z_score(&prof[PROF_I_5V],  i_5v_ema));  if (z > z_max) z_max = z;
+                z = fabsf(cec_rail_profile_z_score(&prof[PROF_I_3V3], i_3v3_ema)); if (z > z_max) z_max = z;
+            }
+        }
+        bool z_above = (z_max > LAYER3_Z_THRESHOLD);
+        if (z_above && !s_z_above_last) {
+            esp_err_t terr = cec_capture_trigger(CEC_TRIG_ANOMALY);
+            if (terr == ESP_OK) {
+                ESP_LOGW(TAG, "burst trigger: ANOMALY (z_max=%.2f)", z_max);
+            }
+        }
+        s_z_above_last = z_above;
+
+        /* Push a pre-trigger sample every iteration so the ring buffer
+         * always holds the last ~20 s of filtered telemetry. */
+        cec_capture_sample_t pre = {
+            .ts_ms  = (uint32_t)(esp_timer_get_time() / 1000),
+            .state  = (uint8_t)s_state,
+            .v_12v  = v_12v_ema,  .i_12v  = i_12v_ema,
+            .v_5v   = v_5v_ema,   .i_5v   = i_5v_ema,
+            .v_3v3  = v_3v3_ema,  .i_3v3  = i_3v3_ema,
+            .v_5vsb = v_5vsb_ema, .i_5vsb = i_5vsb_ema,
+            .temp_c = temp_ema,
+        };
+        cec_capture_push(&pre);
 
         if (iter % TELEPLOT_DIVIDER == 0) {
+            /* Use the device-side millisecond clock for every TelePlot
+             * row so the slow-loop output shares a time base with the
+             * burst-capture b_*hs_* streams. Without this TelePlot
+             * auto-stamps with the host wallclock and the two streams
+             * can't be aligned. */
+            int64_t now_ms = esp_timer_get_time() / 1000;
             if (ok_5vsb) {
-                teleplot_emit("v_5vsb",     v_5vsb);
-                teleplot_emit("v_5vsb_ema", v_5vsb_ema);
-                teleplot_emit("i_5vsb_raw", i_5vsb);
-                teleplot_emit("i_5vsb_ema", i_5vsb_ema);
+                teleplot_emit_t("v_5vsb",     now_ms, v_5vsb);
+                teleplot_emit_t("v_5vsb_ema", now_ms, v_5vsb_ema);
+                teleplot_emit_t("i_5vsb_raw", now_ms, i_5vsb);
+                teleplot_emit_t("i_5vsb_ema", now_ms, i_5vsb_ema);
             }
-            if (ok_v_12v) { teleplot_emit("v_12v", v_12v); teleplot_emit("v_12v_ema", v_12v_ema); }
-            if (ok_v_5v)  { teleplot_emit("v_5v",  v_5v);  teleplot_emit("v_5v_ema",  v_5v_ema);  }
-            if (ok_v_3v3) { teleplot_emit("v_3v3", v_3v3); teleplot_emit("v_3v3_ema", v_3v3_ema); }
-            if (ok_i_12v) { teleplot_emit("i_12v", i_12v); teleplot_emit("i_12v_ema", i_12v_ema); }
-            if (ok_i_5v)  { teleplot_emit("i_5v",  i_5v);  teleplot_emit("i_5v_ema",  i_5v_ema);  }
-            if (ok_i_3v3) { teleplot_emit("i_3v3", i_3v3); teleplot_emit("i_3v3_ema", i_3v3_ema); }
-            if (ok_temp)  { teleplot_emit("temp_c", temp_c); teleplot_emit("temp_c_ema", temp_ema); }
-            teleplot_emit("p_total", p_total);
-            teleplot_emit("state",   (float)s_state);
-            teleplot_emit("sev_12v",  (float)sev_12v);
-            teleplot_emit("sev_5v",   (float)sev_5v);
-            teleplot_emit("sev_3v3",  (float)sev_3v3);
-            teleplot_emit("sev_5vsb", (float)sev_5vsb);
+            if (ok_v_12v) { teleplot_emit_t("v_12v", now_ms, v_12v); teleplot_emit_t("v_12v_ema", now_ms, v_12v_ema); }
+            if (ok_v_5v)  { teleplot_emit_t("v_5v",  now_ms, v_5v);  teleplot_emit_t("v_5v_ema",  now_ms, v_5v_ema);  }
+            if (ok_v_3v3) { teleplot_emit_t("v_3v3", now_ms, v_3v3); teleplot_emit_t("v_3v3_ema", now_ms, v_3v3_ema); }
+            if (ok_i_12v) { teleplot_emit_t("i_12v", now_ms, i_12v); teleplot_emit_t("i_12v_ema", now_ms, i_12v_ema); }
+            if (ok_i_5v)  { teleplot_emit_t("i_5v",  now_ms, i_5v);  teleplot_emit_t("i_5v_ema",  now_ms, i_5v_ema);  }
+            if (ok_i_3v3) { teleplot_emit_t("i_3v3", now_ms, i_3v3); teleplot_emit_t("i_3v3_ema", now_ms, i_3v3_ema); }
+            if (ok_temp)  { teleplot_emit_t("temp_c", now_ms, temp_c); teleplot_emit_t("temp_c_ema", now_ms, temp_ema); }
+            teleplot_emit_t("p_total", now_ms, p_total);
+            teleplot_emit_t("state",   now_ms, (float)s_state);
+            teleplot_emit_t("sev_12v",  now_ms, (float)sev_12v);
+            teleplot_emit_t("sev_5v",   now_ms, (float)sev_5v);
+            teleplot_emit_t("sev_3v3",  now_ms, (float)sev_3v3);
+            teleplot_emit_t("sev_5vsb", now_ms, (float)sev_5vsb);
+            teleplot_emit_t("z_max",    now_ms, z_max);
         }
 
         if (iter % LOG_DIVIDER == 0) {
