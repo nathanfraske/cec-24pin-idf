@@ -16,6 +16,7 @@
 #include <stdint.h>
 #include <inttypes.h>
 #include <math.h>
+#include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -268,6 +269,30 @@ static float s_i_swing_3v3_buf[CURRENT_SWING_WINDOW_SIZE];
 static bool    s_profiles_dirty = false;
 static int64_t s_last_nvs_save_us = 0;
 
+/* Shutdown detection: 1-second rate-of-change window on v_12v_ema.
+ * Triggers when 12V is dropping faster than 0.5 V/s from a nominal-ish
+ * starting point (> 5 V) — i.e. the PSU is in the middle of going down.
+ * Fires CEC_TRIG_SHUTDOWN (bypasses cooldown so a real shutdown still
+ * captures even if a recent burst is in cooldown) and asserts a 30 s
+ * mute window during which all detector layers go quiet so we don't
+ * spam triggers on collapsing rails. The mute clears either by timeout
+ * or by the state classifier landing on OFF or STANDBY, whichever
+ * comes first.
+ *
+ * The 5VSB-defined STANDBY in cec_state_classify is what makes this
+ * clean: STANDBY now explicitly means "main rails off, 5VSB up",
+ * which is the canonical post-shutdown stable state, so reaching it
+ * is a positive signal that the shutdown has completed. */
+#define V_12V_RATE_HISTORY_SIZE        50           /* 1 s at 50 Hz */
+#define V_12V_SHUTDOWN_RATE_THRESHOLD  (-0.5f)      /* V/s, negative */
+#define V_12V_SHUTDOWN_MIN_ARMED_V     5.0f         /* don't trigger if 12V was already low */
+#define SHUTDOWN_MUTE_DURATION_US      (30LL * 1000 * 1000)
+static float   s_v_12v_history[V_12V_RATE_HISTORY_SIZE];
+static size_t  s_v_12v_hist_idx = 0;
+static size_t  s_v_12v_hist_count = 0;
+static bool    s_shutting_down = false;
+static int64_t s_shutdown_start_us = 0;
+
 /* Runtime-toggleable layer enables, persisted to NVS so they survive
  * reboots. Defaults are all-on. Toggle via the serial CLI. */
 typedef struct {
@@ -390,6 +415,17 @@ static void reset_swing_windows(void)
     cec_swing_detector_reset_empty(&s_i_swing_12v);
     cec_swing_detector_reset_empty(&s_i_swing_5v);
     cec_swing_detector_reset_empty(&s_i_swing_3v3);
+}
+
+/* Same idea for the v_12v rate-of-change history that drives shutdown
+ * detection: clear it on state-up so the first 1 s of in-state
+ * sampling refills it cleanly instead of being polluted by 0 V values
+ * from STANDBY/OFF. */
+static void reset_v_12v_history(void)
+{
+    memset(s_v_12v_history, 0, sizeof(s_v_12v_history));
+    s_v_12v_hist_idx = 0;
+    s_v_12v_hist_count = 0;
 }
 
 /* Load profiles from NVS if the stored blob is valid; otherwise leave
@@ -647,12 +683,15 @@ static int cli_cmd_status(int argc, char **argv)
                    cec_state_name((cec_state_t)s),
                    cec_rail_profile_is_warm(&s_profiles[s][PROF_V_12V]) ? "true" : "false");
         }
-        printf("},\"nvs\":{\"profiles_dirty\":%s}}\n",
+        printf("},\"shutting_down\":%s,\"nvs\":{\"profiles_dirty\":%s}}\n",
+               s_shutting_down ? "true" : "false",
                s_profiles_dirty ? "true" : "false");
         return 0;
     }
 
-    printf("state:    %s  (dwell %lld ms)\n", cec_state_name(s_state), (long long)dwell_ms);
+    printf("state:    %s  (dwell %lld ms)%s\n",
+           cec_state_name(s_state), (long long)dwell_ms,
+           s_shutting_down ? "  [shutdown muted]" : "");
     printf("V:        12=%.3f  5=%.3f  3V3=%.3f  5SB=%.3f\n",
            ema_value(&s_v_12v_ema), ema_value(&s_v_5v_ema),
            ema_value(&s_v_3v3_ema), ema_value(&s_v_5vsb_ema));
@@ -809,6 +848,40 @@ void app_main(void)
                       + (v_5v_ema  * i_5v_ema)
                       + (v_3v3_ema * i_3v3_ema);
 
+        /* Update 12V rate-of-change history (1 s window). The "oldest"
+         * sample is whatever sits at the slot we're about to overwrite. */
+        float v_12v_oldest = s_v_12v_history[s_v_12v_hist_idx];
+        s_v_12v_history[s_v_12v_hist_idx] = v_12v_ema;
+        s_v_12v_hist_idx = (s_v_12v_hist_idx + 1) % V_12V_RATE_HISTORY_SIZE;
+        if (s_v_12v_hist_count < V_12V_RATE_HISTORY_SIZE) s_v_12v_hist_count++;
+        bool rate_valid = (s_v_12v_hist_count >= V_12V_RATE_HISTORY_SIZE);
+        float v_12v_rate = rate_valid ? (v_12v_ema - v_12v_oldest) : 0.0f;
+
+        /* Shutdown detection: 12V was nominal-ish and is now falling
+         * fast. Fire the burst and assert the mute. The capture path
+         * has SHUTDOWN-bypasses-cooldown built in, so this always
+         * captures even if a previous burst was recent. */
+        if (rate_valid && !s_shutting_down
+            && v_12v_ema > V_12V_SHUTDOWN_MIN_ARMED_V
+            && v_12v_rate < V_12V_SHUTDOWN_RATE_THRESHOLD) {
+            s_shutting_down = true;
+            s_shutdown_start_us = esp_timer_get_time();
+            ESP_LOGW(TAG, "SHUTDOWN DETECTED (12V dropping %.2f V/s); muting detectors for %ds",
+                     v_12v_rate, (int)(SHUTDOWN_MUTE_DURATION_US / 1000000));
+            esp_err_t terr = cec_capture_trigger(CEC_TRIG_SHUTDOWN);
+            if (terr == ESP_OK) {
+                ESP_LOGW(TAG, "burst trigger: SHUTDOWN");
+            }
+        }
+        /* Auto-clear the mute on timeout (e.g. brown-out that recovered
+         * without ever transitioning through STANDBY/OFF). The state-
+         * change clear is handled in the transition block below. */
+        if (s_shutting_down
+            && (esp_timer_get_time() - s_shutdown_start_us) > SHUTDOWN_MUTE_DURATION_US) {
+            s_shutting_down = false;
+            ESP_LOGI(TAG, "shutdown mute window expired");
+        }
+
         cec_state_t next_state = cec_state_classify(v_12v_ema, v_5vsb_ema, p_total, s_state);
         if (next_state != s_state) {
             int64_t now_us = esp_timer_get_time();
@@ -825,7 +898,18 @@ void app_main(void)
                 reset_emas_on_state_up();
                 reset_layer2_counters();
                 reset_swing_windows();
+                reset_v_12v_history();
                 s_z_above_last = false;
+            }
+            /* Landing in OFF or STANDBY means the shutdown sequence
+             * resolved (PSU unplugged → OFF, switched off → STANDBY).
+             * Clear the mute so detectors arm again as soon as the
+             * settle window passes. */
+            if (s_shutting_down
+                && (next_state == CEC_STATE_OFF || next_state == CEC_STATE_STANDBY)) {
+                s_shutting_down = false;
+                ESP_LOGI(TAG, "shutdown mute cleared by transition to %s",
+                         cec_state_name(next_state));
             }
             s_state = next_state;
             s_state_entered_us = now_us;
@@ -847,14 +931,18 @@ void app_main(void)
         bool main_rails_armed = l1_settled
             && (s_state == CEC_STATE_IDLE || s_state == CEC_STATE_ACTIVE || s_state == CEC_STATE_PEAK);
         bool sb_rail_armed = l1_settled && (s_state != CEC_STATE_OFF);
-        /* "active" = state-armed AND runtime-enabled. The settings flag
-         * lets the operator silence a layer at runtime without rebuilding. */
-        bool l1_main_active = s_settings.layer1 && main_rails_armed;
-        bool l1_sb_active   = s_settings.layer1 && sb_rail_armed;
-        bool l2_active      = s_settings.layer2 && main_rails_armed;
-        bool l3_active      = s_settings.layer3 && main_rails_armed;
-        bool sp_active      = s_settings.swing_power   && main_rails_armed;
-        bool sc_active      = s_settings.swing_current && main_rails_armed;
+        /* "active" = state-armed AND runtime-enabled AND not in the
+         * shutdown mute window. The settings flag lets the operator
+         * silence a layer at runtime; the shutdown mute keeps every
+         * detector quiet while the rails are collapsing so the only
+         * trigger that fires during a shutdown is CEC_TRIG_SHUTDOWN. */
+        bool armed = !s_shutting_down;
+        bool l1_main_active = s_settings.layer1 && main_rails_armed && armed;
+        bool l1_sb_active   = s_settings.layer1 && sb_rail_armed   && armed;
+        bool l2_active      = s_settings.layer2 && main_rails_armed && armed;
+        bool l3_active      = s_settings.layer3 && main_rails_armed && armed;
+        bool sp_active      = s_settings.swing_power   && main_rails_armed && armed;
+        bool sc_active      = s_settings.swing_current && main_rails_armed && armed;
 
         cec_severity_t sev_12v = CEC_SEV_NONE;
         cec_severity_t sev_5v  = CEC_SEV_NONE;
@@ -1065,6 +1153,7 @@ void app_main(void)
             teleplot_emit_t("sev_3v3",  now_ms, (float)sev_3v3);
             teleplot_emit_t("sev_5vsb", now_ms, (float)sev_5vsb);
             teleplot_emit_t("z_max",    now_ms, z_max);
+            teleplot_emit_t("shutting_down", now_ms, s_shutting_down ? 1.0f : 0.0f);
             if (cec_swing_detector_is_full(&s_power_swing)) {
                 teleplot_emit_t("p_window_mean", now_ms, p_window_mean);
                 teleplot_emit_t("p_swing_thr",   now_ms, p_swing_thresh);

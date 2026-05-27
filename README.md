@@ -65,6 +65,7 @@ Tracking the port progress from Arduino-ESP32 v0.5.9 to ESP-IDF:
 | Burst capture engine | Done (non-blocking, oneshot ADC; DMA path pending) |
 | NVS profile storage | Done |
 | Serial command interface | Done (burst / set / status; ACS712 cal deferred — moving to INA226s) |
+| Shutdown detection + mute window | Done |
 
 ## Behavior parity check
 
