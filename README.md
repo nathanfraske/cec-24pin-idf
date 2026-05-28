@@ -80,6 +80,17 @@ Tracking the port progress from Arduino-ESP32 v0.5.9 to ESP-IDF:
 
 Once each component lands, run side-by-side captures against the v0.5.9 baseline on the same PSU and same workloads, and compare the resulting bursts. Any divergence beyond measurement noise is a porting bug to track down before that component is considered done.
 
+## Serial topology
+
+Two USB-C ports carry firmware output on the 24-pin board, matching the layout used by `cec-eps-idf`:
+
+| Port | Transport | Content | Baud |
+|---|---|---|---|
+| **JTAG USB-C** | Native ESP32-S3 USB Serial-JTAG | CLI input, `ESP_LOG` output, command responses, boot banner | host-side default (CDC) |
+| **UART USB-C** | CH340K bridge to UART0 (GPIO 43 TX / 44 RX) | All TelePlot lines — 10 Hz steady-state telemetry plus `>BURST_BEGIN ... >BURST_END` dumps | 921600 |
+
+Splitting the streams keeps the heavy traffic (~600 KB per burst at full fidelity) off the same wire that's carrying CLI input. `cec_telemetry` owns the UART side; `teleplot_emit*` / `teleplot_writef` calls route through `uart_write_bytes` once `cec_telemetry_init_uart()` has run, with an automatic stdio fallback if the UART driver can't come up (e.g. the secondary cable isn't plugged in during dev).
+
 ## API migration reference
 
 For each Arduino-ESP32 API the v0.5.9 firmware uses, the ESP-IDF equivalent:
