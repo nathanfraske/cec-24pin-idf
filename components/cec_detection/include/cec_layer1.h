@@ -17,15 +17,11 @@
 
 #pragma once
 
+#include "cec_state.h"  /* for cec_severity_t */
+
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-typedef enum {
-    CEC_SEV_NONE = 0,
-    CEC_SEV_WARNING,
-    CEC_SEV_CRITICAL,
-} cec_severity_t;
 
 typedef struct {
     float nominal;     /* Nominal rail voltage (e.g. 12.0) */
@@ -59,11 +55,6 @@ cec_severity_t cec_layer1_update(cec_layer1_detector_t *d, float v_rail);
  * during a later state change can't immediately trip CRITICAL.
  */
 void cec_layer1_reset(cec_layer1_detector_t *d);
-
-/*
- * Human-readable severity name. Always returns a valid pointer.
- */
-const char *cec_severity_name(cec_severity_t s);
 
 #ifdef __cplusplus
 }

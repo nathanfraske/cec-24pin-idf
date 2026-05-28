@@ -3,6 +3,9 @@ idf_component_register(
     INCLUDE_DIRS "."
     REQUIRES
         # CEC components
+        cec_common
+        cec_filters
+        cec_nvs
         cec_sensors
         cec_detection
         cec_capture

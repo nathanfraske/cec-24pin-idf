@@ -19,12 +19,17 @@ cec-24pin-idf/
 │   ├── CMakeLists.txt          Main component config
 │   └── main.c                  Entry point (app_main)
 └── components/
-    ├── cec_sensors/            Hardware abstractions: INA226, ACS712, NTC
-    ├── cec_detection/          State classifier, swing detectors, profiles
-    └── cec_capture/            Burst capture engine, pre-trigger buffer
+    ├── cec_common/             Shared enums (cec_state_t, cec_severity_t)
+    ├── cec_filters/            EMA + rolling-median primitives
+    ├── cec_nvs/                Thin NVS save/load/clear blob wrapper
+    ├── cec_sensors/            Hardware abstractions: INA226, ACS712, NTC, ADC1
+    ├── cec_detection/          State classifier, Layer 1/2/3, swing detectors
+    ├── cec_capture/            Burst capture engine, pre-trigger ring
+    ├── cec_telemetry/          TelePlot output helpers
+    └── cec_cli/                Line-based serial command interface
 ```
 
-Component-based layout is intentional. Each component is hardware-agnostic where possible so it can be reused in the planned ESP32-P4 firmware for the 12VHPWR module.
+Component-based layout is intentional. Each component is hardware-agnostic where possible so it can be reused in the planned ESP32-P4 firmware for the 12VHPWR module, and the small headers-only components (`cec_common`, `cec_filters`) are explicitly shaped to be vendored unchanged into the sibling [`cec-eps-idf`](https://github.com/nathanfraske/cec-eps-idf) repo.
 
 ## Build
 
