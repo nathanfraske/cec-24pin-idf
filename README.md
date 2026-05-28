@@ -56,7 +56,7 @@ Tracking the port progress from Arduino-ESP32 v0.5.9 to ESP-IDF:
 | ADC oneshot reads — rail voltages (12V/5V/3V3) | Done |
 | ADC oneshot reads — NTC temperature | Done |
 | ADC oneshot reads — rail currents (i_12V/i_5V/i_3V3 via ACS712) | Done (zero-point cal pending) |
-| ADC continuous mode (for HS burst) | Pending |
+| ADC continuous mode (DMA) | Done |
 | Sample loop at 50 Hz | Done |
 | EMA / median filter primitives | Done |
 | Teleplot output via USB CDC | Done |
