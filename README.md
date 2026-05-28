@@ -47,7 +47,7 @@ Tracking the port progress from Arduino-ESP32 v0.5.9 to ESP-IDF:
 | Component | Status |
 |---|---|
 | Project skeleton | Done |
-| Hello World boot | Pending hardware test |
+| Hello World boot | Done (validated on prototype hardware) |
 | I2C master driver (for INA226) | Done |
 | ADC oneshot reads — rail voltages (12V/5V/3V3) | Done |
 | ADC oneshot reads — NTC temperature | Done |
@@ -59,10 +59,13 @@ Tracking the port progress from Arduino-ESP32 v0.5.9 to ESP-IDF:
 | State classifier | Done |
 | Layer 1 static thresholds | Done |
 | Layer 2 (adaptive transient) | Done |
-| Layer 3 (Z-score anomaly) | Done (NVS-backed profiles pending) |
+| Layer 3 (Z-score anomaly) | Done |
+| Power-swing detector | Done |
+| Current-swing detector | Done |
 | Burst capture engine | Done (non-blocking, oneshot ADC; DMA path pending) |
-| NVS profile storage | Pending |
-| Serial command interface | Pending |
+| NVS profile storage | Done |
+| Serial command interface | Done (burst / set / status; ACS712 cal deferred — moving to INA226s) |
+| Shutdown detection + mute window | Done |
 
 ## Behavior parity check
 

@@ -16,6 +16,7 @@
 #include <stdint.h>
 #include <inttypes.h>
 #include <math.h>
+#include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -35,7 +36,10 @@
 #include "cec_layer1.h"
 #include "cec_layer2.h"
 #include "cec_layer3.h"
+#include "cec_swing.h"
+#include "cec_nvs.h"
 #include "cec_capture.h"
+#include "cec_cli.h"
 #include "cec_teleplot.h"
 
 static const char *TAG = "cec_main";
@@ -232,6 +236,78 @@ typedef enum {
 static cec_rail_profile_t s_profiles[CEC_STATE_COUNT][PROF_COUNT];
 static bool s_z_above_last = false;
 
+/* Power swing: 250-sample rolling window (~5 s at 50 Hz). Adaptive
+ * threshold = max(8 W, 25% * window_mean), 2 consecutive bad samples
+ * (~40 ms) before firing. From v0.5.9. */
+#define POWER_SWING_WINDOW_SIZE        250
+#define POWER_SWING_CONSECUTIVE        2
+#define POWER_SWING_MIN_THRESHOLD_W    8.0f
+#define POWER_SWING_FRACTION           0.25f
+static cec_swing_detector_t s_power_swing;
+static float s_power_swing_buf[POWER_SWING_WINDOW_SIZE];
+
+/* Current swing: per-rail 250-sample rolling window with fixed
+ * thresholds. 3 consecutive bad samples (~60 ms) before firing. From
+ * v0.5.9. Only one rail fires per iteration (priority 12V > 5V > 3V3). */
+#define CURRENT_SWING_WINDOW_SIZE      250
+#define CURRENT_SWING_CONSECUTIVE      3
+#define CURRENT_SWING_THRESH_I_12V     0.30f
+#define CURRENT_SWING_THRESH_I_5V      0.50f
+#define CURRENT_SWING_THRESH_I_3V3     0.30f
+static cec_swing_detector_t s_i_swing_12v, s_i_swing_5v, s_i_swing_3v3;
+static float s_i_swing_12v_buf[CURRENT_SWING_WINDOW_SIZE];
+static float s_i_swing_5v_buf [CURRENT_SWING_WINDOW_SIZE];
+static float s_i_swing_3v3_buf[CURRENT_SWING_WINDOW_SIZE];
+
+/* NVS persistence for Layer 3 profiles. The magic prefix lets a future
+ * firmware revision reject an old blob cleanly if the layout changes. */
+#define NVS_PROFILES_KEY     "profiles"
+#define NVS_PROFILES_MAGIC   0xCEC30001U
+#define NVS_SETTINGS_KEY     "settings"
+#define NVS_SETTINGS_MAGIC   0xCEC50001U
+#define NVS_SAVE_INTERVAL_US (5LL * 60 * 1000 * 1000)   /* 5 minutes */
+static bool    s_profiles_dirty = false;
+static int64_t s_last_nvs_save_us = 0;
+
+/* Shutdown detection: 1-second rate-of-change window on v_12v_ema.
+ * Triggers when 12V is dropping faster than 0.5 V/s from a nominal-ish
+ * starting point (> 5 V) — i.e. the PSU is in the middle of going down.
+ * Fires CEC_TRIG_SHUTDOWN (bypasses cooldown so a real shutdown still
+ * captures even if a recent burst is in cooldown) and asserts a 30 s
+ * mute window during which all detector layers go quiet so we don't
+ * spam triggers on collapsing rails. The mute clears either by timeout
+ * or by the state classifier landing on OFF or STANDBY, whichever
+ * comes first.
+ *
+ * The 5VSB-defined STANDBY in cec_state_classify is what makes this
+ * clean: STANDBY now explicitly means "main rails off, 5VSB up",
+ * which is the canonical post-shutdown stable state, so reaching it
+ * is a positive signal that the shutdown has completed. */
+#define V_12V_RATE_HISTORY_SIZE        50           /* 1 s at 50 Hz */
+#define V_12V_SHUTDOWN_RATE_THRESHOLD  (-0.5f)      /* V/s, negative */
+#define V_12V_SHUTDOWN_MIN_ARMED_V     5.0f         /* don't trigger if 12V was already low */
+#define SHUTDOWN_MUTE_DURATION_US      (30LL * 1000 * 1000)
+static float   s_v_12v_history[V_12V_RATE_HISTORY_SIZE];
+static size_t  s_v_12v_hist_idx = 0;
+static size_t  s_v_12v_hist_count = 0;
+static bool    s_shutting_down = false;
+static int64_t s_shutdown_start_us = 0;
+
+/* Runtime-toggleable layer enables, persisted to NVS so they survive
+ * reboots. Defaults are all-on. Toggle via the serial CLI. */
+typedef struct {
+    bool layer1;
+    bool layer2;
+    bool layer3;
+    bool swing_power;
+    bool swing_current;
+} cec_settings_t;
+static cec_settings_t s_settings = {
+    .layer1 = true, .layer2 = true, .layer3 = true,
+    .swing_power = true, .swing_current = true,
+};
+static bool s_settings_dirty = false;
+
 static void init_i2c_bus(void)
 {
     i2c_master_bus_config_t bus_cfg = {
@@ -315,6 +391,94 @@ static void reset_layer2_counters(void)
     cec_layer2_reset(&s_l2_i_12v);
     cec_layer2_reset(&s_l2_i_5v);
     cec_layer2_reset(&s_l2_i_3v3);
+}
+
+static void init_swing_detectors(void)
+{
+    cec_swing_detector_init(&s_power_swing, s_power_swing_buf,
+                            POWER_SWING_WINDOW_SIZE, POWER_SWING_CONSECUTIVE);
+    cec_swing_detector_init(&s_i_swing_12v, s_i_swing_12v_buf,
+                            CURRENT_SWING_WINDOW_SIZE, CURRENT_SWING_CONSECUTIVE);
+    cec_swing_detector_init(&s_i_swing_5v,  s_i_swing_5v_buf,
+                            CURRENT_SWING_WINDOW_SIZE, CURRENT_SWING_CONSECUTIVE);
+    cec_swing_detector_init(&s_i_swing_3v3, s_i_swing_3v3_buf,
+                            CURRENT_SWING_WINDOW_SIZE, CURRENT_SWING_CONSECUTIVE);
+}
+
+/* On state-up the rails go from ~0 V to nominal in milliseconds; the
+ * swing windows had been collecting near-zero samples and the new
+ * "huge swing" would otherwise fire on the very first IDLE sample.
+ * Empty the windows so they re-fill cleanly from in-state values. */
+static void reset_swing_windows(void)
+{
+    cec_swing_detector_reset_empty(&s_power_swing);
+    cec_swing_detector_reset_empty(&s_i_swing_12v);
+    cec_swing_detector_reset_empty(&s_i_swing_5v);
+    cec_swing_detector_reset_empty(&s_i_swing_3v3);
+}
+
+/* Same idea for the v_12v rate-of-change history that drives shutdown
+ * detection: clear it on state-up so the first 1 s of in-state
+ * sampling refills it cleanly instead of being polluted by 0 V values
+ * from STANDBY/OFF. */
+static void reset_v_12v_history(void)
+{
+    memset(s_v_12v_history, 0, sizeof(s_v_12v_history));
+    s_v_12v_hist_idx = 0;
+    s_v_12v_hist_count = 0;
+}
+
+/* Load profiles from NVS if the stored blob is valid; otherwise leave
+ * the (already-zeroed) profile array alone. Logs the outcome so it's
+ * obvious from the boot log whether we picked up warm state. */
+static void load_profiles_from_nvs(void)
+{
+    esp_err_t err = cec_nvs_load_blob(NVS_PROFILES_KEY, NVS_PROFILES_MAGIC,
+                                      s_profiles, sizeof(s_profiles));
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "NVS: loaded profiles (%u bytes)",
+                 (unsigned)sizeof(s_profiles));
+    } else if (err == ESP_ERR_NOT_FOUND) {
+        ESP_LOGI(TAG, "NVS: no saved profiles, starting cold");
+    } else if (err == ESP_ERR_INVALID_VERSION || err == ESP_ERR_INVALID_SIZE) {
+        ESP_LOGW(TAG, "NVS: stored profiles unusable (%s), clearing and starting cold",
+                 esp_err_to_name(err));
+        cec_nvs_clear_blob(NVS_PROFILES_KEY);
+    } else {
+        ESP_LOGW(TAG, "NVS: load failed (%s), profiles will warm from cold",
+                 esp_err_to_name(err));
+    }
+}
+
+static void load_settings_from_nvs(void)
+{
+    cec_settings_t loaded;
+    esp_err_t err = cec_nvs_load_blob(NVS_SETTINGS_KEY, NVS_SETTINGS_MAGIC,
+                                      &loaded, sizeof(loaded));
+    if (err == ESP_OK) {
+        s_settings = loaded;
+        ESP_LOGI(TAG, "NVS: loaded settings (L1=%d L2=%d L3=%d sp=%d sc=%d)",
+                 s_settings.layer1, s_settings.layer2, s_settings.layer3,
+                 s_settings.swing_power, s_settings.swing_current);
+    } else if (err == ESP_ERR_NOT_FOUND) {
+        ESP_LOGI(TAG, "NVS: no saved settings, using defaults (all-on)");
+    } else if (err == ESP_ERR_INVALID_VERSION || err == ESP_ERR_INVALID_SIZE) {
+        ESP_LOGW(TAG, "NVS: stored settings unusable (%s), clearing",
+                 esp_err_to_name(err));
+        cec_nvs_clear_blob(NVS_SETTINGS_KEY);
+    }
+}
+
+static void save_settings_to_nvs(void)
+{
+    esp_err_t err = cec_nvs_save_blob(NVS_SETTINGS_KEY, NVS_SETTINGS_MAGIC,
+                                      &s_settings, sizeof(s_settings));
+    if (err == ESP_OK) {
+        s_settings_dirty = false;
+        ESP_LOGI(TAG, "NVS: saved settings");
+    } else {
+        ESP_LOGW(TAG, "NVS: settings save failed: %s", esp_err_to_name(err));
+    }
 }
 
 /* Re-prime EMAs to the next sample on transitions UP into the
@@ -409,6 +573,154 @@ static void hs_sample_fn(cec_capture_hs_sample_t *out)
     acs712_read_amps(&s_hs_acs_3v3, &out->i_3v3);
 }
 
+/* ---------------------------- CLI handlers ---------------------------- */
+
+/* Trigger a manual burst with optional caller-supplied annotation text.
+ * Tokens argv[1..argc-1] are space-joined into a single annotation. If
+ * no text is supplied the burst still fires with reason=MANUAL but
+ * without an annotation line. */
+static int cli_cmd_burst(int argc, char **argv)
+{
+    char text[96];
+    text[0] = '\0';
+    if (argc >= 2) {
+        size_t pos = 0;
+        for (int i = 1; i < argc; i++) {
+            size_t avail = sizeof(text) - pos - 1;
+            if (avail == 0) break;
+            if (i > 1) { text[pos++] = ' '; if (pos >= sizeof(text) - 1) break; avail--; }
+            size_t n = strlen(argv[i]);
+            if (n > avail) n = avail;
+            memcpy(text + pos, argv[i], n);
+            pos += n;
+            text[pos] = '\0';
+        }
+    }
+    esp_err_t err = cec_capture_trigger_with_text(CEC_TRIG_MANUAL,
+                                                   text[0] ? text : NULL);
+    if (err == ESP_OK) {
+        printf("burst triggered (manual%s%s)\n",
+               text[0] ? ", annotation: " : "",
+               text[0] ? text : "");
+        return 0;
+    }
+    if (err == ESP_ERR_NOT_FINISHED) {
+        printf("error: capture already running\n");
+    } else if (err == ESP_ERR_INVALID_STATE) {
+        printf("error: within cooldown window\n");
+    } else {
+        printf("error: %s\n", esp_err_to_name(err));
+    }
+    return 1;
+}
+
+static bool *settings_flag_for(const char *name)
+{
+    if (strcmp(name, "layer1") == 0 || strcmp(name, "l1") == 0)
+        return &s_settings.layer1;
+    if (strcmp(name, "layer2") == 0 || strcmp(name, "l2") == 0)
+        return &s_settings.layer2;
+    if (strcmp(name, "layer3") == 0 || strcmp(name, "l3") == 0)
+        return &s_settings.layer3;
+    if (strcmp(name, "swing_power") == 0 || strcmp(name, "sp") == 0)
+        return &s_settings.swing_power;
+    if (strcmp(name, "swing_current") == 0 || strcmp(name, "sc") == 0)
+        return &s_settings.swing_current;
+    return NULL;
+}
+
+static int cli_cmd_set(int argc, char **argv)
+{
+    if (argc != 3) {
+        printf("usage: set <layer1|layer2|layer3|swing_power|swing_current> <on|off>\n");
+        return 1;
+    }
+    bool *flag = settings_flag_for(argv[1]);
+    if (flag == NULL) {
+        printf("error: unknown setting '%s'\n", argv[1]);
+        return 1;
+    }
+    bool new_value;
+    if (strcmp(argv[2], "on") == 0 || strcmp(argv[2], "1") == 0)        new_value = true;
+    else if (strcmp(argv[2], "off") == 0 || strcmp(argv[2], "0") == 0)  new_value = false;
+    else {
+        printf("error: value must be 'on' or 'off'\n");
+        return 1;
+    }
+    *flag = new_value;
+    s_settings_dirty = true;
+    save_settings_to_nvs();
+    printf("%s = %s\n", argv[1], new_value ? "on" : "off");
+    return 0;
+}
+
+static int cli_cmd_status(int argc, char **argv)
+{
+    bool json = (argc >= 2 && strcmp(argv[1], "json") == 0);
+    int64_t now_us = esp_timer_get_time();
+    int64_t dwell_ms = (now_us - s_state_entered_us) / 1000;
+
+    if (json) {
+        printf("{\"state\":\"%s\",\"dwell_ms\":%lld,",
+               cec_state_name(s_state), (long long)dwell_ms);
+        printf("\"v\":{\"12v\":%.3f,\"5v\":%.3f,\"3v3\":%.3f,\"5vsb\":%.3f},",
+               ema_value(&s_v_12v_ema), ema_value(&s_v_5v_ema),
+               ema_value(&s_v_3v3_ema), ema_value(&s_v_5vsb_ema));
+        printf("\"i\":{\"12v\":%.3f,\"5v\":%.3f,\"3v3\":%.3f,\"5vsb\":%.4f},",
+               ema_value(&s_i_12v_ema), ema_value(&s_i_5v_ema),
+               ema_value(&s_i_3v3_ema), ema_value(&s_i_5vsb_ema));
+        printf("\"temp_c\":%.2f,", ema_value(&s_temp_ema));
+        printf("\"layers\":{\"l1\":%s,\"l2\":%s,\"l3\":%s,\"swing_power\":%s,\"swing_current\":%s},",
+               s_settings.layer1 ? "true" : "false",
+               s_settings.layer2 ? "true" : "false",
+               s_settings.layer3 ? "true" : "false",
+               s_settings.swing_power ? "true" : "false",
+               s_settings.swing_current ? "true" : "false");
+        printf("\"profile_warm\":{");
+        for (int s = 0; s < CEC_STATE_COUNT; s++) {
+            printf("%s\"%s\":%s",
+                   s > 0 ? "," : "",
+                   cec_state_name((cec_state_t)s),
+                   cec_rail_profile_is_warm(&s_profiles[s][PROF_V_12V]) ? "true" : "false");
+        }
+        printf("},\"shutting_down\":%s,\"nvs\":{\"profiles_dirty\":%s}}\n",
+               s_shutting_down ? "true" : "false",
+               s_profiles_dirty ? "true" : "false");
+        return 0;
+    }
+
+    printf("state:    %s  (dwell %lld ms)%s\n",
+           cec_state_name(s_state), (long long)dwell_ms,
+           s_shutting_down ? "  [shutdown muted]" : "");
+    printf("V:        12=%.3f  5=%.3f  3V3=%.3f  5SB=%.3f\n",
+           ema_value(&s_v_12v_ema), ema_value(&s_v_5v_ema),
+           ema_value(&s_v_3v3_ema), ema_value(&s_v_5vsb_ema));
+    printf("I:        12=%.3f  5=%.3f  3V3=%.3f  5SB=%.4f\n",
+           ema_value(&s_i_12v_ema), ema_value(&s_i_5v_ema),
+           ema_value(&s_i_3v3_ema), ema_value(&s_i_5vsb_ema));
+    printf("temp:     %.2f C\n", ema_value(&s_temp_ema));
+    printf("layers:   L1=%s L2=%s L3=%s  swing/power=%s  swing/current=%s\n",
+           s_settings.layer1 ? "on" : "off",
+           s_settings.layer2 ? "on" : "off",
+           s_settings.layer3 ? "on" : "off",
+           s_settings.swing_power ? "on" : "off",
+           s_settings.swing_current ? "on" : "off");
+    printf("profiles: ");
+    for (int s = 0; s < CEC_STATE_COUNT; s++) {
+        printf("%s=%s  ", cec_state_name((cec_state_t)s),
+               cec_rail_profile_is_warm(&s_profiles[s][PROF_V_12V]) ? "warm" : "cold");
+    }
+    printf("\n");
+    printf("nvs:      profiles_dirty=%s\n", s_profiles_dirty ? "yes" : "no");
+    return 0;
+}
+
+static const cec_cli_command_t s_cli_commands[] = {
+    { "burst",  "burst now [reason text...] — fire a manual burst capture",  cli_cmd_burst  },
+    { "set",    "set <layer1|layer2|layer3|swing_power|swing_current> <on|off>", cli_cmd_set },
+    { "status", "status [json] — current state, EMA readings, layer enables, profile warmth", cli_cmd_status },
+};
+
 static void log_hardware_info(void)
 {
     esp_chip_info_t chip_info;
@@ -466,6 +778,21 @@ void app_main(void)
     init_layer1();
     init_layer2();
     init_layer3_profiles();
+    init_swing_detectors();
+
+    if (cec_nvs_init() == ESP_OK) {
+        load_profiles_from_nvs();
+        load_settings_from_nvs();
+    } else {
+        ESP_LOGW(TAG, "NVS init failed; profiles will not persist across boots");
+    }
+
+    esp_err_t cli_err = cec_cli_init(s_cli_commands,
+                                     sizeof(s_cli_commands) / sizeof(s_cli_commands[0]));
+    if (cli_err != ESP_OK) {
+        ESP_LOGW(TAG, "cec_cli_init failed: %s — serial commands unavailable",
+                 esp_err_to_name(cli_err));
+    }
 
     log_acs712_zero_measurements();
 
@@ -521,6 +848,40 @@ void app_main(void)
                       + (v_5v_ema  * i_5v_ema)
                       + (v_3v3_ema * i_3v3_ema);
 
+        /* Update 12V rate-of-change history (1 s window). The "oldest"
+         * sample is whatever sits at the slot we're about to overwrite. */
+        float v_12v_oldest = s_v_12v_history[s_v_12v_hist_idx];
+        s_v_12v_history[s_v_12v_hist_idx] = v_12v_ema;
+        s_v_12v_hist_idx = (s_v_12v_hist_idx + 1) % V_12V_RATE_HISTORY_SIZE;
+        if (s_v_12v_hist_count < V_12V_RATE_HISTORY_SIZE) s_v_12v_hist_count++;
+        bool rate_valid = (s_v_12v_hist_count >= V_12V_RATE_HISTORY_SIZE);
+        float v_12v_rate = rate_valid ? (v_12v_ema - v_12v_oldest) : 0.0f;
+
+        /* Shutdown detection: 12V was nominal-ish and is now falling
+         * fast. Fire the burst and assert the mute. The capture path
+         * has SHUTDOWN-bypasses-cooldown built in, so this always
+         * captures even if a previous burst was recent. */
+        if (rate_valid && !s_shutting_down
+            && v_12v_ema > V_12V_SHUTDOWN_MIN_ARMED_V
+            && v_12v_rate < V_12V_SHUTDOWN_RATE_THRESHOLD) {
+            s_shutting_down = true;
+            s_shutdown_start_us = esp_timer_get_time();
+            ESP_LOGW(TAG, "SHUTDOWN DETECTED (12V dropping %.2f V/s); muting detectors for %ds",
+                     v_12v_rate, (int)(SHUTDOWN_MUTE_DURATION_US / 1000000));
+            esp_err_t terr = cec_capture_trigger(CEC_TRIG_SHUTDOWN);
+            if (terr == ESP_OK) {
+                ESP_LOGW(TAG, "burst trigger: SHUTDOWN");
+            }
+        }
+        /* Auto-clear the mute on timeout (e.g. brown-out that recovered
+         * without ever transitioning through STANDBY/OFF). The state-
+         * change clear is handled in the transition block below. */
+        if (s_shutting_down
+            && (esp_timer_get_time() - s_shutdown_start_us) > SHUTDOWN_MUTE_DURATION_US) {
+            s_shutting_down = false;
+            ESP_LOGI(TAG, "shutdown mute window expired");
+        }
+
         cec_state_t next_state = cec_state_classify(v_12v_ema, v_5vsb_ema, p_total, s_state);
         if (next_state != s_state) {
             int64_t now_us = esp_timer_get_time();
@@ -536,7 +897,19 @@ void app_main(void)
             if (next_state >= CEC_STATE_IDLE && s_state < CEC_STATE_IDLE) {
                 reset_emas_on_state_up();
                 reset_layer2_counters();
+                reset_swing_windows();
+                reset_v_12v_history();
                 s_z_above_last = false;
+            }
+            /* Landing in OFF or STANDBY means the shutdown sequence
+             * resolved (PSU unplugged → OFF, switched off → STANDBY).
+             * Clear the mute so detectors arm again as soon as the
+             * settle window passes. */
+            if (s_shutting_down
+                && (next_state == CEC_STATE_OFF || next_state == CEC_STATE_STANDBY)) {
+                s_shutting_down = false;
+                ESP_LOGI(TAG, "shutdown mute cleared by transition to %s",
+                         cec_state_name(next_state));
             }
             s_state = next_state;
             s_state_entered_us = now_us;
@@ -558,6 +931,18 @@ void app_main(void)
         bool main_rails_armed = l1_settled
             && (s_state == CEC_STATE_IDLE || s_state == CEC_STATE_ACTIVE || s_state == CEC_STATE_PEAK);
         bool sb_rail_armed = l1_settled && (s_state != CEC_STATE_OFF);
+        /* "active" = state-armed AND runtime-enabled AND not in the
+         * shutdown mute window. The settings flag lets the operator
+         * silence a layer at runtime; the shutdown mute keeps every
+         * detector quiet while the rails are collapsing so the only
+         * trigger that fires during a shutdown is CEC_TRIG_SHUTDOWN. */
+        bool armed = !s_shutting_down;
+        bool l1_main_active = s_settings.layer1 && main_rails_armed && armed;
+        bool l1_sb_active   = s_settings.layer1 && sb_rail_armed   && armed;
+        bool l2_active      = s_settings.layer2 && main_rails_armed && armed;
+        bool l3_active      = s_settings.layer3 && main_rails_armed && armed;
+        bool sp_active      = s_settings.swing_power   && main_rails_armed && armed;
+        bool sc_active      = s_settings.swing_current && main_rails_armed && armed;
 
         cec_severity_t sev_12v = CEC_SEV_NONE;
         cec_severity_t sev_5v  = CEC_SEV_NONE;
@@ -565,7 +950,7 @@ void app_main(void)
         cec_severity_t sev_5vsb = CEC_SEV_NONE;
         bool any_entered_crit = false;
 
-        if (main_rails_armed) {
+        if (l1_main_active) {
             layer1_step_result_t r;
             r = layer1_step("12V", &s_l1_12v, &s_last_sev_12v, v_12v_ema);
             sev_12v = r.sev; any_entered_crit |= r.entered_critical;
@@ -578,7 +963,7 @@ void app_main(void)
             cec_layer1_reset(&s_l1_5v);  s_last_sev_5v  = CEC_SEV_NONE;
             cec_layer1_reset(&s_l1_3v3); s_last_sev_3v3 = CEC_SEV_NONE;
         }
-        if (sb_rail_armed) {
+        if (l1_sb_active) {
             layer1_step_result_t r5sb = layer1_step("5VSB", &s_l1_5vsb, &s_last_sev_5vsb, v_5vsb_ema);
             sev_5vsb = r5sb.sev;
             any_entered_crit |= r5sb.entered_critical;
@@ -597,15 +982,11 @@ void app_main(void)
             }
         }
 
-        /* Layers 2 and 3 share the same gating as the Layer 1 main rails:
-         * only run when settled in IDLE/ACTIVE/PEAK. During OFF/STANDBY
-         * the main rails are zero and the comparisons aren't meaningful;
-         * the settle window covers EMA / variance-estimator convergence
-         * after a state-up transition. */
-        bool detection_armed = main_rails_armed;
-
+        /* Layers 2 and 3 share the rail-state gating with Layer 1's main
+         * rails, then layer with their own enable flag so the operator
+         * can silence either layer at runtime. */
         bool l2_fired = false;
-        if (detection_armed) {
+        if (l2_active) {
             l2_fired |= cec_layer2_update(&s_l2_v_12v,  v_12v,  v_12v_ema);
             l2_fired |= cec_layer2_update(&s_l2_v_5v,   v_5v,   v_5v_ema);
             l2_fired |= cec_layer2_update(&s_l2_v_3v3,  v_3v3,  v_3v3_ema);
@@ -630,7 +1011,7 @@ void app_main(void)
          * gated on transition (z stayed below, now crossed above)
          * so a sustained anomaly doesn't spam the trigger path. */
         float z_max = 0.0f;
-        if (detection_armed) {
+        if (l3_active) {
             cec_rail_profile_t *prof = s_profiles[s_state];
             cec_rail_profile_update(&prof[PROF_V_12V],  v_12v_ema,  PROFILE_ADAPT_RATE);
             cec_rail_profile_update(&prof[PROF_V_5V],   v_5v_ema,   PROFILE_ADAPT_RATE);
@@ -641,6 +1022,7 @@ void app_main(void)
             cec_rail_profile_update(&prof[PROF_I_3V3],  i_3v3_ema,  PROFILE_ADAPT_RATE);
             cec_rail_profile_update(&prof[PROF_I_5VSB], i_5vsb_ema, PROFILE_ADAPT_RATE);
             cec_rail_profile_update(&prof[PROF_TEMP],   temp_ema,   PROFILE_ADAPT_RATE);
+            s_profiles_dirty = true;
 
             if (cec_rail_profile_is_warm(&prof[PROF_V_12V])) {
                 float z;
@@ -660,6 +1042,76 @@ void app_main(void)
             }
         }
         s_z_above_last = z_above;
+
+        /* Power swing: adaptive threshold against the 5-second window
+         * mean. Reset baseline on fire so the post-event behavior gets
+         * its own debounce window. */
+        float p_window_mean = cec_swing_detector_mean(&s_power_swing);
+        float p_swing_thresh = fmaxf(POWER_SWING_MIN_THRESHOLD_W,
+                                     POWER_SWING_FRACTION * p_window_mean);
+        if (sp_active) {
+            if (cec_swing_detector_update(&s_power_swing, p_total, p_swing_thresh)) {
+                ESP_LOGW(TAG, "POWER SWING: now=%.1f W, mean=%.1f W, swing=%+.1f W, thr=%.1f W",
+                         p_total, p_window_mean, p_total - p_window_mean, p_swing_thresh);
+                esp_err_t terr = cec_capture_trigger(CEC_TRIG_POWER_SWING);
+                if (terr == ESP_OK) {
+                    ESP_LOGW(TAG, "burst trigger: POWER_SWING");
+                }
+                cec_swing_detector_reset_to(&s_power_swing, p_total);
+            }
+        } else {
+            cec_swing_detector_reset_empty(&s_power_swing);
+        }
+
+        /* Per-rail current swing. Fire on the first rail to trip, with
+         * 12V > 5V > 3V3 priority so the log message identifies one
+         * specific cause. Re-baseline all three windows on fire. */
+        if (sc_active) {
+            bool f12 = cec_swing_detector_update(&s_i_swing_12v, i_12v_ema, CURRENT_SWING_THRESH_I_12V);
+            bool f5  = cec_swing_detector_update(&s_i_swing_5v,  i_5v_ema,  CURRENT_SWING_THRESH_I_5V);
+            bool f3v3 = cec_swing_detector_update(&s_i_swing_3v3, i_3v3_ema, CURRENT_SWING_THRESH_I_3V3);
+            const char *fired_rail = NULL;
+            float fired_val = 0.0f, fired_mean = 0.0f;
+            if (f12)       { fired_rail = "12V"; fired_val = i_12v_ema; fired_mean = cec_swing_detector_mean(&s_i_swing_12v); }
+            else if (f5)   { fired_rail = "5V";  fired_val = i_5v_ema;  fired_mean = cec_swing_detector_mean(&s_i_swing_5v);  }
+            else if (f3v3) { fired_rail = "3V3"; fired_val = i_3v3_ema; fired_mean = cec_swing_detector_mean(&s_i_swing_3v3); }
+            if (fired_rail != NULL) {
+                ESP_LOGW(TAG, "CURRENT SWING on %s: now=%.3f A, mean=%.3f A, swing=%+.3f A",
+                         fired_rail, fired_val, fired_mean, fired_val - fired_mean);
+                esp_err_t terr = cec_capture_trigger(CEC_TRIG_CURRENT_SWING);
+                if (terr == ESP_OK) {
+                    ESP_LOGW(TAG, "burst trigger: CURRENT_SWING");
+                }
+                cec_swing_detector_reset_to(&s_i_swing_12v, i_12v_ema);
+                cec_swing_detector_reset_to(&s_i_swing_5v,  i_5v_ema);
+                cec_swing_detector_reset_to(&s_i_swing_3v3, i_3v3_ema);
+            }
+        } else {
+            cec_swing_detector_reset_empty(&s_i_swing_12v);
+            cec_swing_detector_reset_empty(&s_i_swing_5v);
+            cec_swing_detector_reset_empty(&s_i_swing_3v3);
+        }
+
+        /* Periodic NVS save. Only run if profiles got dirty since the
+         * last save, and only every NVS_SAVE_INTERVAL_US to limit flash
+         * wear. The 50 Hz loop calls this every iteration; the time
+         * check is the gate. */
+        if (s_profiles_dirty
+            && (esp_timer_get_time() - s_last_nvs_save_us) > NVS_SAVE_INTERVAL_US) {
+            esp_err_t err = cec_nvs_save_blob(NVS_PROFILES_KEY, NVS_PROFILES_MAGIC,
+                                              s_profiles, sizeof(s_profiles));
+            if (err == ESP_OK) {
+                s_profiles_dirty = false;
+                s_last_nvs_save_us = esp_timer_get_time();
+                ESP_LOGI(TAG, "NVS: saved profiles (%u bytes)",
+                         (unsigned)sizeof(s_profiles));
+            } else {
+                ESP_LOGW(TAG, "NVS: save failed: %s", esp_err_to_name(err));
+                /* Back off until the next interval so we don't spam on
+                 * persistent errors. */
+                s_last_nvs_save_us = esp_timer_get_time();
+            }
+        }
 
         /* Push a pre-trigger sample every iteration so the ring buffer
          * always holds the last ~20 s of filtered telemetry. */
@@ -701,6 +1153,11 @@ void app_main(void)
             teleplot_emit_t("sev_3v3",  now_ms, (float)sev_3v3);
             teleplot_emit_t("sev_5vsb", now_ms, (float)sev_5vsb);
             teleplot_emit_t("z_max",    now_ms, z_max);
+            teleplot_emit_t("shutting_down", now_ms, s_shutting_down ? 1.0f : 0.0f);
+            if (cec_swing_detector_is_full(&s_power_swing)) {
+                teleplot_emit_t("p_window_mean", now_ms, p_window_mean);
+                teleplot_emit_t("p_swing_thr",   now_ms, p_swing_thresh);
+            }
         }
 
         if (iter % LOG_DIVIDER == 0) {
