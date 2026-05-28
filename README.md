@@ -4,6 +4,10 @@ This is the ESP-IDF port of the CEC 24-pin module firmware, replacing the Arduin
 
 The original Arduino-ESP32 firmware at v0.5.9 remains the working backup until this port has been validated against captured-data behavior parity.
 
+## Related projects
+
+- [`cec-eps-idf`](https://github.com/nathanfraske/cec-eps-idf) — companion firmware for the CEC EPS module. Both repos share the same ESP-IDF component layout (`cec_sensors` / `cec_detection` / `cec_capture` / `cec_telemetry` / `cec_cli`), build flow, and TelePlot-over-USB-CDC output format, so any reproducible-firmware tooling that works against one works against the other.
+
 ## Project layout
 
 ```
