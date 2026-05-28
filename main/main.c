@@ -332,6 +332,10 @@ static esp_err_t init_adc_rails(void)
     ESP_RETURN_ON_ERROR(acs712_setup(&s_acs_5v),             TAG, "setup i_5V");
     ESP_RETURN_ON_ERROR(acs712_setup(&s_acs_3v3),            TAG, "setup i_3V3");
     ESP_RETURN_ON_ERROR(thermistor_setup(&s_ntc),            TAG, "setup NTC");
+    /* Pattern locked once we hit start; from here on, channel reads
+     * come from the DMA-backed latest-mV table maintained by the
+     * cec_adc reader task. */
+    ESP_RETURN_ON_ERROR(cec_adc_start(),                     TAG, "cec_adc_start");
     return ESP_OK;
 }
 

@@ -15,7 +15,7 @@
 #pragma once
 
 #include "esp_err.h"
-#include "esp_adc/adc_oneshot.h"
+#include "esp_adc/adc_continuous.h"
 
 #ifdef __cplusplus
 extern "C" {

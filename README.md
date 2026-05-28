@@ -4,6 +4,10 @@ This is the ESP-IDF port of the CEC 24-pin module firmware, replacing the Arduin
 
 The original Arduino-ESP32 firmware at v0.5.9 remains the working backup until this port has been validated against captured-data behavior parity.
 
+## Related projects
+
+- [`cec-eps-idf`](https://github.com/nathanfraske/cec-eps-idf) — companion firmware for the CEC EPS module. Both repos share the same ESP-IDF component layout (`cec_sensors` / `cec_detection` / `cec_capture` / `cec_telemetry` / `cec_cli`), build flow, and TelePlot-over-USB-CDC output format, so any reproducible-firmware tooling that works against one works against the other.
+
 ## Project layout
 
 ```
@@ -52,7 +56,7 @@ Tracking the port progress from Arduino-ESP32 v0.5.9 to ESP-IDF:
 | ADC oneshot reads — rail voltages (12V/5V/3V3) | Done |
 | ADC oneshot reads — NTC temperature | Done |
 | ADC oneshot reads — rail currents (i_12V/i_5V/i_3V3 via ACS712) | Done (zero-point cal pending) |
-| ADC continuous mode (for HS burst) | Pending |
+| ADC continuous mode (DMA) | Done |
 | Sample loop at 50 Hz | Done |
 | EMA / median filter primitives | Done |
 | Teleplot output via USB CDC | Done |
@@ -85,3 +89,9 @@ For each Arduino-ESP32 API the v0.5.9 firmware uses, the ESP-IDF equivalent:
 | `delay()` | `vTaskDelay(pdMS_TO_TICKS(ms))` |
 | `Preferences` (NVS) | `nvs_*` API directly |
 | `WiFi.mode(WIFI_OFF)` | Don't init WiFi component at all (excluded via sdkconfig) |
+
+## License
+
+Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for the
+full text.
+
