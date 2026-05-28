@@ -85,3 +85,9 @@ For each Arduino-ESP32 API the v0.5.9 firmware uses, the ESP-IDF equivalent:
 | `delay()` | `vTaskDelay(pdMS_TO_TICKS(ms))` |
 | `Preferences` (NVS) | `nvs_*` API directly |
 | `WiFi.mode(WIFI_OFF)` | Don't init WiFi component at all (excluded via sdkconfig) |
+
+## License
+
+Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for the
+full text.
+
