@@ -19,6 +19,16 @@ static const char *TAG = "cec_capture";
 #define HS_BURST_BUF_SIZE      4000
 #define HS_SAMPLE_INTERVAL_US  1000
 
+/* Capture current on every HS sample (1 kHz); capture bus voltage on
+ * every 10th (~100 Hz) — the I2C budget at 400 kHz can't carry all six
+ * INA226 reads every 1 ms, and rail voltage is slow-moving anyway. */
+#define HS_VOLTAGE_DECIMATE    10
+
+/* After switching the sensors to fast mode, wait a couple of conversion
+ * times so the first HS sample reflects the new mode, not a stale
+ * steady-mode value. */
+#define HS_MODE_SETTLE_MS      2
+
 /* Cooldown between bursts. SHUTDOWN bypasses this so a real shutdown
  * sequence can still be captured even if it follows another trigger. */
 #define BURST_COOLDOWN_US      (10LL * 1000 * 1000)
@@ -37,6 +47,8 @@ static volatile int s_pre_write_idx = 0;
 static volatile int s_pre_count = 0;
 
 static cec_capture_hs_sample_fn_t s_hs_fn = NULL;
+static cec_capture_hs_hook_fn_t   s_hs_setup_fn = NULL;
+static cec_capture_hs_hook_fn_t   s_hs_teardown_fn = NULL;
 static SemaphoreHandle_t s_trigger_sem = NULL;
 static TaskHandle_t s_hs_task = NULL;
 
@@ -161,12 +173,17 @@ static void dump_hs(int64_t hs_start_us)
     for (int i = 0; i < HS_BURST_BUF_SIZE; i++) {
         const cec_capture_hs_sample_t *s = &s_hs_buf[i];
         unsigned ts = (unsigned)(hs_start_ms + (s->ts_us_offset / 1000));
-        teleplot_writef(">hs_v_12v:%u:%.3f\n", ts, s->v_12v);
+        /* Current on every sample (1 kHz). */
         teleplot_writef(">hs_i_12v:%u:%.3f\n", ts, s->i_12v);
-        teleplot_writef(">hs_v_5v:%u:%.3f\n",  ts, s->v_5v);
         teleplot_writef(">hs_i_5v:%u:%.3f\n",  ts, s->i_5v);
-        teleplot_writef(">hs_v_3v3:%u:%.3f\n", ts, s->v_3v3);
         teleplot_writef(">hs_i_3v3:%u:%.3f\n", ts, s->i_3v3);
+        /* Voltage only on the decimated (~100 Hz) samples where it was
+         * actually read; the rest carry no fresh v_* so we don't emit it. */
+        if (i % HS_VOLTAGE_DECIMATE == 0) {
+            teleplot_writef(">hs_v_12v:%u:%.3f\n", ts, s->v_12v);
+            teleplot_writef(">hs_v_5v:%u:%.3f\n",  ts, s->v_5v);
+            teleplot_writef(">hs_v_3v3:%u:%.3f\n", ts, s->v_3v3);
+        }
     }
 }
 
@@ -184,37 +201,47 @@ static void hs_capture_task(void *arg)
         ESP_LOGI(TAG, "burst trigger=%s, capturing %d HS samples at 1 kHz",
                  cec_trigger_name(reason), HS_BURST_BUF_SIZE);
 
+        /* Switch sensors to fast conversion mode for the burst, then let
+         * the first conversions settle before sampling. */
+        if (s_hs_setup_fn != NULL) {
+            s_hs_setup_fn();
+            vTaskDelay(pdMS_TO_TICKS(HS_MODE_SETTLE_MS));
+        }
+
         int64_t hs_start_us = esp_timer_get_time();
         int64_t target_us = hs_start_us;
-        int zero_artifacts = 0;
+        int carried = 0;
         for (int i = 0; i < HS_BURST_BUF_SIZE; i++) {
             target_us += HS_SAMPLE_INTERVAL_US;
             spin_until(target_us);
             cec_capture_hs_sample_t *s = &s_hs_buf[i];
             s->ts_us_offset = (uint32_t)(esp_timer_get_time() - hs_start_us);
-            s_hs_fn(s);
+            bool want_voltage = (i % HS_VOLTAGE_DECIMATE == 0);
+            bool ok = s_hs_fn(s, want_voltage);
 
-            /* SAR-ADC glitch mitigation: empirically ~1% of samples come
-             * back with all three voltages at exactly 0.0 even though the
-             * underlying reads returned ESP_OK. Indistinguishable from a
-             * real "all rails off" except by likelihood — for HS capture
-             * the carry-forward is far more useful than the zero dip, and
-             * the trade-off only bites if a burst happens to be running
-             * across a true full-rail collapse (which is rare and will
-             * show as a flat-line in the carry-forward window). */
-            if (i > 0 && s->v_12v == 0.0f && s->v_5v == 0.0f && s->v_3v3 == 0.0f) {
+            /* On a failed I2C read, carry the previous sample forward so
+             * the stream stays continuous instead of dropping to zero.
+             * Shows as a flat-line if a real collapse coincides — rare
+             * and easy to spot. */
+            if (!ok && i > 0) {
                 const cec_capture_hs_sample_t *prev = &s_hs_buf[i - 1];
                 s->v_12v = prev->v_12v; s->i_12v = prev->i_12v;
                 s->v_5v  = prev->v_5v;  s->i_5v  = prev->i_5v;
                 s->v_3v3 = prev->v_3v3; s->i_3v3 = prev->i_3v3;
-                zero_artifacts++;
+                carried++;
             }
         }
         int64_t hs_end_us = esp_timer_get_time();
-        ESP_LOGI(TAG, "HS capture done in %lld us (zero-artifact replacements: %d/%d), "
+
+        /* Restore steady conversion mode before the (slow) dump. */
+        if (s_hs_teardown_fn != NULL) {
+            s_hs_teardown_fn();
+        }
+
+        ESP_LOGI(TAG, "HS capture done in %lld us (carried-forward: %d/%d), "
                       "dumping pre+HS to TelePlot",
                  (long long)(hs_end_us - hs_start_us),
-                 zero_artifacts, HS_BURST_BUF_SIZE);
+                 carried, HS_BURST_BUF_SIZE);
 
         teleplot_writef(">BURST_BEGIN:%s:%d_normal+%d_hs:%d\n",
                         cec_trigger_name(reason),
@@ -234,12 +261,14 @@ static void hs_capture_task(void *arg)
     }
 }
 
-esp_err_t cec_capture_init(cec_capture_hs_sample_fn_t hs_sample_fn)
+esp_err_t cec_capture_init(const cec_capture_config_t *cfg)
 {
     if (s_inited) return ESP_OK;
-    if (hs_sample_fn == NULL) return ESP_ERR_INVALID_ARG;
+    if (cfg == NULL || cfg->sample_fn == NULL) return ESP_ERR_INVALID_ARG;
 
-    s_hs_fn = hs_sample_fn;
+    s_hs_fn = cfg->sample_fn;
+    s_hs_setup_fn = cfg->setup_fn;
+    s_hs_teardown_fn = cfg->teardown_fn;
     memset(s_pre_buf, 0, sizeof(s_pre_buf));
     s_pre_write_idx = 0;
     s_pre_count = 0;

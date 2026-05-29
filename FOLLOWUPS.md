@@ -13,24 +13,35 @@ fragility issues.
 
 | # | Severity | Where | Item |
 |---|---|---|---|
-| L1 | medium (latent) | `main.c` main loop, `cec_layer2_update` calls | Layer 2 is fed the **raw** instantaneous reading, which stays `0.0f` on a failed read while its EMA reference falls back to last-good. On the I²C-fed 5VSB rail a sustained read failure (3 consecutive at 50 Hz) yields a `~5 V` deviation and a spurious `TRANSIENT` burst. Fix: on a failed read, feed the EMA value as the instant too (or skip that channel's L2 update that iteration). Every other consumer (p_total, swings, classifier) already uses the held EMA. |
-| L2 | medium (fragility) | `cec_capture.c` `spin_until` + `hs_capture_task` | The HS burst busy-spins one core for ~4 s via `taskYIELD`-polling, which starves the Core 1 idle task to ~80% of the default 5 s task-watchdog window — no margin for a larger `HS_BURST_BUF_SIZE` or more per-sample work. Also the ADC reader task is unpinned and lower-priority than the HS task, so it survives a burst only by migrating to Core 0; pinning it to Core 1 later would stale the HS cache mid-burst (flatline capture). Now that ADC is continuous/DMA, `spin_until` can `vTaskDelayUntil` instead of busy-spinning, removing both hazards. |
+| L1 | ✅ fixed (v2 sensor PR) | `main.c` main loop | The raw instantaneous reading now holds at the last-good EMA on a failed/skipped read, so Layer 2 can't see a full-scale deviation from an I²C glitch. Especially relevant now that all four rails are I²C. |
+| L2 | medium (fragility) | `cec_capture.c` `spin_until` + `hs_capture_task` | The HS burst busy-spins one core for ~4 s via `taskYIELD`-polling, which starves the Core 1 idle task to ~80% of the default 5 s task-watchdog window — no margin for a larger `HS_BURST_BUF_SIZE` or more per-sample work. With the v2 INA226 HS path each sample is a blocking I²C read (not a cache hit), so `spin_until` could be replaced with a `vTaskDelay`-based pace that yields to the idle task between samples. Still worth doing. |
 | L3 | low (smell) | `main.c` periodic save block | `cec_nvs_save_blob` (`nvs_set_blob` + `nvs_commit`) runs synchronously in the 50 Hz supervisor loop. Flash erase/write disables cache on both cores — a multi-hundred-ms loop stall every 5 min when profiles are dirty. Move to a low-priority one-shot task. |
 | L4 | low (benign race) | `cec_capture.c` `cec_capture_trigger_with_text` | Check-then-set on `s_busy` isn't atomic; the main loop and CLI call the trigger from different tasks. Binary semaphore swallows the double-give, so worst case is a misleading "burst triggered" log with no second capture. A short critical section or atomic CAS closes it. |
 | L5 | low (by design) | `cec_capture.c` `cec_capture_push` vs `dump_pretrigger` | Core 0 keeps writing the pre-trigger ring while Core 1 reads it during a dump. Memory-safe (modulo'd indices, fixed array) but can emit a few torn rows in the diagnostic dump. Inherent to the non-blocking design; documenting, not necessarily fixing. |
 | L6 | nit | `main.c` shutdown detection | `v_12v_rate` is a raw ΔV over the 50-sample history but is compared against a `-0.5f` "V/s" threshold — correct only because 50 samples × 20 ms = exactly 1 s. Changing `V_12V_RATE_HISTORY_SIZE` or `SAMPLE_PERIOD_MS` silently breaks the units. Either divide by the real window seconds or add a static-assert tying the two constants together. |
-| L7 | nit (stale) | `cec_capture.c` HS loop | The "~1% SAR-ADC zero-artifact" carry-forward is near-dead post-DMA (continuous mode holds the last value, never returns exactly 0), and its comment still describes the old oneshot behavior. Drop the mitigation or refresh the comment. |
+| L7 | ✅ fixed (v2 sensor PR) | `cec_capture.c` HS loop | The stale SAR-ADC zero-artifact heuristic was replaced with an explicit carry-forward keyed on the HS sample callback returning failure. |
 
 ## EPS-parity deferrals
 
 From the cross-repo TODO list; carried over as the EPS side evolves.
 
 - **B1** — Add `cec_load_state_t` and `CEC_LOAD_COUNT` to `cec_common/include/cec_state.h` (TODO marker already in place), mirroring the EPS-side `cec_classifier.c` enum. Land the actual values when next syncing EPS source so the two repos can include each other's headers without name clashes.
-- **D1** — ACS712 driver style: the 24-pin uses a `const`-config struct + `_measure_zero_point` helper; the EPS-side `acs758` keeps a runtime-mutable ctx with in-place cal. Both work. If either is rewritten, the const-config + measure-helper pattern is the cleaner target. Low priority — and moot here once the rails move to INA226.
+- **D1** — ~~ACS712 driver style~~ moot: ACS712 removed in the v2 sensor swap; all rails are INA226 now.
 - **A4 / G** — `cec_comms` component for CAN/TWAI when CAN ships on the 24-pin. Use the `esp_twai_onchip` node-handle API directly (skip the deprecated `driver/twai.h`). EPS-side `cec_comms/cec_can.c` is the reference; adapt frame layout / IDs for the 24-pin payload.
 
-## Hardware-driven
+## Daughterboard bring-up (pending hardware)
 
-- ACS712 → INA226 swap on all rails (planned). Fixes the residual trim drift
-  and the i_5v zero-load noise, and brings the per-rail current path onto the
-  same I²C device family as 5VSB. Brings a runtime INA226 cal command with it.
+The shared daughterboard isn't built for this module yet. When the pigtail lands:
+
+- **NTC thermistor** (ADC1_CH6 / GPIO7): re-enable the ADC path —
+  `cec_adc_init` + `cec_adc_setup_channel(ADC_CHANNEL_6)` + `cec_adc_start`,
+  and restore the `thermistor_read_celsius` call + `ok_temp` in the main loop.
+  `thermistor.c` already targets GPIO7; `cec_adc`/`thermistor` are still in the
+  `cec_sensors` build, just unused. β = 3950, 10 kΩ NTC, 10 kΩ series to 3.3 V.
+- **CAN / TWAI** (TX GPIO4, RX GPIO15 — moved from GPIO5 in v2): stand up the
+  `cec_comms` component (see A4/G). RX is on ADC2/GPIO15 deliberately so all of
+  ADC1 stays free for sensors.
+- **INA226 bus at 1 MHz (Fast-mode-Plus):** optional, unlocks HS *voltage* at
+  the full 1 kHz alongside current. Gated on the §6 pull-up fix (lift 3 of the
+  4 module pull-ups) holding up at speed — check for garbage on the inputs
+  before trusting it. Today HS voltage is decimated to ~100 Hz at 400 kHz.

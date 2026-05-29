@@ -22,12 +22,24 @@ extern "C" {
 /* Opaque handle for an INA226 device. */
 typedef struct ina226_dev_t* ina226_handle_t;
 
+/* Configuration-register presets (reg 0x00).
+ *
+ *   STEADY = AVG 16, VBUSCT 1.1 ms, VSHCT 1.1 ms, shunt+bus continuous.
+ *            Full update ~35 ms (~28 Hz). The v2 recommended steady value.
+ *   HS     = AVG 1,  VBUSCT 140 us, VSHCT 140 us, shunt+bus continuous.
+ *            Fresh shunt+bus pair every ~280 us (~3.5 kHz). Used only for
+ *            the duration of a high-speed burst, then restored to STEADY.
+ */
+#define INA226_CONFIG_STEADY  0x4527
+#define INA226_CONFIG_HS      0x4007
+
 /* Configuration for an INA226 instance. */
 typedef struct {
     i2c_master_bus_handle_t bus_handle;   /* I2C bus this device sits on */
     uint8_t i2c_addr;                     /* 7-bit I2C address (0x40-0x4F) */
     float shunt_ohms;                     /* Physical shunt resistor value */
-    float max_current_a;                  /* Target max current; determines CURRENT_LSB */
+    float max_current_a;                  /* Target max current; determines CURRENT_LSB / CAL */
+    uint16_t config_value;                /* Config-register value written at create (0x00) */
     uint32_t scl_speed_hz;                /* Per-device SCL speed (typically 400000) */
     float voltage_trim;                   /* Multiplier applied to bus voltage (1.0 = raw) */
     float current_trim;                   /* Multiplier applied to current (1.0 = raw) */
@@ -39,6 +51,7 @@ typedef struct {
     .i2c_addr = 0x40,                                   \
     .shunt_ohms = 0.002f,                               \
     .max_current_a = 5.0f,                              \
+    .config_value = INA226_CONFIG_STEADY,               \
     .scl_speed_hz = 400000,                             \
     .voltage_trim = 1.0f,                               \
     .current_trim = 1.0f,                               \
@@ -62,6 +75,14 @@ esp_err_t ina226_create(const ina226_config_t *config, ina226_handle_t *out_hand
 esp_err_t ina226_destroy(ina226_handle_t handle);
 
 /*
+ * Overwrite the configuration register (0x00). Used to switch a device
+ * between INA226_CONFIG_STEADY and INA226_CONFIG_HS around a high-speed
+ * burst. Takes effect on the next conversion; allow ~one conversion time
+ * for the first fresh sample after a mode change.
+ */
+esp_err_t ina226_set_config(ina226_handle_t handle, uint16_t config_value);
+
+/*
  * Read the bus voltage in volts. Trim factor is applied.
  *
  * The INA226 bus voltage register has 1.25 mV LSB resolution and a maximum
@@ -70,10 +91,13 @@ esp_err_t ina226_destroy(ina226_handle_t handle);
 esp_err_t ina226_read_bus_voltage(ina226_handle_t handle, float *out_volts);
 
 /*
- * Read the current in amps. Trim factor is applied.
+ * Read the current in amps. Trim factor is applied. Sign reflects current
+ * direction.
  *
- * Sign reflects current direction. Saturates at max_current_a configured at
- * create time.
+ * Computed in software from the shunt-voltage register and the configured
+ * shunt resistance (I = V_shunt / R_shunt), which sidesteps the calibration
+ * register entirely — appropriate for the v2 board's non-standard shunt
+ * values. Independent of the CAL register.
  */
 esp_err_t ina226_read_current(ina226_handle_t handle, float *out_amps);
 

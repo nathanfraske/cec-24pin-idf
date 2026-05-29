@@ -59,7 +59,12 @@ typedef struct {
 } cec_capture_sample_t;
 
 /* HS sample (1 kHz, main rails only). Slim by design so the buffer
- * fits comfortably and per-sample callback runtime stays small. */
+ * fits comfortably and per-sample callback runtime stays small.
+ *
+ * v2: current (i_*) is captured on every sample at 1 kHz; bus voltage
+ * (v_*) is captured only on every HS_VOLTAGE_DECIMATE-th sample (~100 Hz),
+ * since at 400 kHz the I2C budget can't carry 6 INA226 reads every 1 ms.
+ * Voltage at the PSU-side Kelvin tap is stiff, so 100 Hz is plenty. */
 typedef struct {
     uint32_t ts_us_offset;   /* microseconds since HS capture start */
     float    v_12v, i_12v;
@@ -67,19 +72,35 @@ typedef struct {
     float    v_3v3, i_3v3;
 } cec_capture_hs_sample_t;
 
-/* Callback the capture engine calls at 1 kHz during the HS window.
- * Must complete well within the 1 ms budget. Runs on the HS task
- * (Core 1 by default) so it can safely call cec_adc_read_mv et al. */
-typedef void (*cec_capture_hs_sample_fn_t)(cec_capture_hs_sample_t *out);
+/* Per-sample HS callback, invoked at 1 kHz on the capture task. Must
+ * complete well within the 1 ms budget. `want_voltage` is true on the
+ * decimated (~100 Hz) samples where the caller should also read bus
+ * voltage; on the others, read current only and leave v_* untouched.
+ * Return false if the underlying reads failed so the engine can carry
+ * the previous sample forward. */
+typedef bool (*cec_capture_hs_sample_fn_t)(cec_capture_hs_sample_t *out, bool want_voltage);
+
+/* Optional hooks run once on the capture task immediately before and
+ * after the 1 kHz HS loop. Used to switch the sensors into a fast
+ * conversion mode for the burst and restore the steady mode after.
+ * Either may be NULL. */
+typedef void (*cec_capture_hs_hook_fn_t)(void);
+
+typedef struct {
+    cec_capture_hs_sample_fn_t sample_fn;    /* required */
+    cec_capture_hs_hook_fn_t   setup_fn;     /* optional: pre-HS (e.g. fast mode) */
+    cec_capture_hs_hook_fn_t   teardown_fn;  /* optional: post-HS (e.g. restore) */
+} cec_capture_config_t;
 
 /* Human-readable trigger name for log/teleplot output. */
 const char *cec_trigger_name(cec_trigger_t t);
 
 /*
  * Initialize the engine. Creates the HS capture task pinned to Core 1,
- * registers the sample callback, zeroes the pre-trigger ring. Idempotent.
+ * registers the callbacks, zeroes the pre-trigger ring. Idempotent.
+ * cfg and cfg->sample_fn must be non-NULL.
  */
-esp_err_t cec_capture_init(cec_capture_hs_sample_fn_t hs_sample_fn);
+esp_err_t cec_capture_init(const cec_capture_config_t *cfg);
 
 /*
  * Push a sample into the pre-trigger ring. Called from the main loop

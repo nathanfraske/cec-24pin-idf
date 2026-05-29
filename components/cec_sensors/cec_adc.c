@@ -4,8 +4,8 @@
  * Replaces the original oneshot implementation. The hardware now samples
  * every configured channel at a fixed cadence (1 kHz per channel) and a
  * dedicated reader task drains the DMA buffer into a per-channel "latest
- * calibrated mV" table. Callers (main loop, ACS712, thermistor, HS burst
- * capture) hit that table on every read — constant-time, lock-free,
+ * calibrated mV" table. Callers (the thermistor driver, and any future
+ * ADC sensor) hit that table on every read — constant-time, lock-free,
  * jitter-free.
  *
  * Why: the oneshot path serialized every read through the ADC unit's
