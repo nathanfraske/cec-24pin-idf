@@ -118,7 +118,7 @@ FOLLOWUPS.
 
 - v1 → ESP-IDF port complete and field-validated; full detection stack done.
 - **PR #8 open**: v2 sensor block (4× INA226), IDF-6.0 build fix, boot I²C
-  scan, the address swap + current-sign inversion above. Bring-up debugging
+  scan, the v2-spec address mapping + current-sign inversion above. Bring-up debugging
   done over chat (addressing/jumpers/wiring); all four INA226 now enumerate.
   Latest commits on the branch address findings from a live-capture
   analysis: per-rail HS bitmask (one bad rail no longer voids the other
@@ -134,6 +134,19 @@ FOLLOWUPS.
   all confirmed; a real 12V collapse was captured end-to-end by a
   shutdown burst. Latest fix on the branch: shutdown mute no longer
   sticks in STANDBY (arm only from running states + level-based clear).
+- **5V/0x41 INA226 died on the bench** (after the 3V3↔5V cables were
+  swapped back to v2 spec): a bad `V+→IN+` shunt-jumper joint bridged to
+  ground, ran away thermally, and cooked the die — the tell was current
+  pinned at full scale (8.19 A) dead flat while `v_5v` still read ~4.8 V.
+  Diagnosis sequence: bus pin healthy + shunt pin saturated + flat-in-HS +
+  module hot ⇒ damaged chip (shunt is metal, positive tempco, can't run
+  away). Module awaits a replacement INA226 — **strap the new one to 0x41
+  (A0→VS, A1→GND)** or it enumerates at the default 0x40. Prompted a
+  **per-rail saturation watchdog** in `main.c`: any rail pinned at its IMAX
+  ceiling (`SAT_PIN_FRACTION`·IMAX) for ~1 s logs a loud `SATURATION on
+  <rail>` warning (sustained over-current *or* a railed/faulty sensor),
+  re-warns every ~5 s, and logs recovery on clear. Fed only fresh reads so
+  a capture-skip or NACK freezes the episode rather than skewing it.
 - Next, when a PSU run goes into ACTIVE/PEAK: fully close out 0x41 under
   heavy load; otherwise the firmware side is validated.
 - Deferred: shutdown-detect *premature-trip* debounce (analyzer C5, distinct

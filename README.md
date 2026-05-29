@@ -58,7 +58,7 @@ Tracking the port progress from Arduino-ESP32 v0.5.9 to ESP-IDF:
 | Project skeleton | Done |
 | Hello World boot | Done (validated on prototype hardware) |
 | I2C master driver | Done |
-| Detection stack (state classifier, Layers 1/2/3, swings, shutdown mute) | Done |
+| Detection stack (state classifier, Layers 1/2/3, swings, shutdown mute, saturation watchdog) | Done |
 | EMA / median filter primitives | Done |
 | Sample loop at 50 Hz | Done |
 | Teleplot output (dual-stream UART) | Done |
@@ -70,7 +70,7 @@ The v0.5.9 → ESP-IDF port is complete; the firmware tracks the prototype board
 
 ## Hardware revisions
 
-**v2 (current):** all four rails sensed by INA226 over I2C0 — `0x40` +12V (0.002 Ω), `0x41` +5V (0.010 Ω), `0x44` +3.3V (0.025 Ω), `0x45` +5VSB (0.025 Ω). Current is computed in software (shunt µV / R_shunt). The v1 ADC voltage-divider taps and ACS712 current sensors are removed. The 1 kHz HS burst reconfigures the three main-rail INA226s to fast mode (~140 µs conversions) and captures current at 1 kHz with voltage decimated to ~100 Hz.
+**v2 (current):** all four rails sensed by INA226 over I2C0 — `0x40` +12V (0.002 Ω), `0x41` +5V (0.010 Ω), `0x44` +3.3V (0.025 Ω), `0x45` +5VSB (0.025 Ω). Current is computed in software (shunt µV / R_shunt). The v1 ADC voltage-divider taps and ACS712 current sensors are removed. The 1 kHz HS burst reconfigures the three main-rail INA226s to fast mode (~140 µs conversions) and captures current at 1 kHz with voltage decimated to ~100 Hz. A per-rail saturation watchdog flags any rail whose current pins at the INA226 full-scale ceiling (±81.92 mV / R_shunt) and holds flat — the signature of a railed/faulty sense front end or a sustained over-current, rather than a real reading.
 
 **Pending the shared daughterboard** (`[PENDING]` in the v2 spec): NTC thermistor on ADC1_CH6 (GPIO7) — `cec_adc`/`thermistor` stay in the build, ADC subsystem uninitialized until wired; and CAN/TWAI (TX GPIO4, RX moved GPIO5→GPIO15) — no `cec_comms` component in this repo yet.
 

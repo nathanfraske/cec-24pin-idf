@@ -191,6 +191,27 @@ static float s_i_swing_12v_buf[CURRENT_SWING_WINDOW_SIZE];
 static float s_i_swing_5v_buf [CURRENT_SWING_WINDOW_SIZE];
 static float s_i_swing_3v3_buf[CURRENT_SWING_WINDOW_SIZE];
 
+/* Per-rail saturation / stuck-current watchdog. The software current path
+ * (shunt_uV / R_shunt) physically caps at the INA226 shunt full scale
+ * (±81.92 mV → ±IMAX), so a railed front end — a floating IN+/IN-, a cooked
+ * die, or a genuine sustained over-current — pins the reading at IMAX and
+ * holds it dead flat. That masquerades as a real, healthy number (the
+ * "solid 8.19 A" that cost a prototype module its INA226), so watch for it
+ * explicitly: after ~1 s pinned, log a loud warning naming the rail;
+ * re-warn every ~5 s while it persists; log a one-line recovery when it
+ * clears. Fed only fresh reads (see the loop), so a transient NACK or a
+ * capture-skipped sample freezes an episode rather than advancing or
+ * resetting it. */
+#define SAT_PIN_FRACTION    0.99f   /* |i| >= 99% of IMAX counts as pinned */
+#define SAT_HOLD_SAMPLES    50u     /* ~1 s at 50 Hz before the first warning */
+#define SAT_REWARN_SAMPLES  250u    /* re-warn cadence (~5 s) while still pinned */
+typedef enum { SAT_EVT_NONE = 0, SAT_EVT_WARN, SAT_EVT_RECOVERED } sat_event_t;
+typedef struct {
+    uint32_t count;    /* consecutive pinned fresh samples */
+    bool     warned;   /* a warning has fired for the current episode */
+} sat_watch_t;
+static sat_watch_t s_sat_12v, s_sat_5v, s_sat_3v3, s_sat_5vsb;
+
 /* NVS persistence for Layer 3 profiles. The magic prefix lets a future
  * firmware revision reject an old blob cleanly if the layout changes. */
 #define NVS_PROFILES_KEY     "profiles"
@@ -697,6 +718,33 @@ static const cec_cli_command_t s_cli_commands[] = {
     { "status", "status [json] — current state, EMA readings, layer enables, profile warmth", cli_cmd_status },
 };
 
+/* Advance one rail's saturation watchdog with a fresh current sample.
+ * Returns SAT_EVT_WARN on the sample where a warning should fire (first at
+ * the hold threshold, then every SAT_REWARN_SAMPLES while still pinned),
+ * SAT_EVT_RECOVERED on the sample where a flagged episode ends, and
+ * SAT_EVT_NONE otherwise. Pure bookkeeping; the caller owns the logging so
+ * it can name the rail. */
+static sat_event_t sat_watch_update(sat_watch_t *w, float i_amps, float imax)
+{
+    if (fabsf(i_amps) >= SAT_PIN_FRACTION * imax) {
+        w->count++;
+        if (w->count == SAT_HOLD_SAMPLES ||
+            (w->count > SAT_HOLD_SAMPLES &&
+             (w->count - SAT_HOLD_SAMPLES) % SAT_REWARN_SAMPLES == 0)) {
+            w->warned = true;
+            return SAT_EVT_WARN;
+        }
+        return SAT_EVT_NONE;
+    }
+    if (w->warned) {            /* a flagged episode just ended */
+        w->count = 0;
+        w->warned = false;
+        return SAT_EVT_RECOVERED;
+    }
+    w->count = 0;
+    return SAT_EVT_NONE;
+}
+
 static void log_hardware_info(void)
 {
     esp_chip_info_t chip_info;
@@ -851,6 +899,34 @@ void app_main(void)
         float i_5v_ema   = ok_i_5v  ? ema_update(&s_i_5v_ema,   i_5v)   : ema_value(&s_i_5v_ema);
         float i_3v3_ema  = ok_i_3v3 ? ema_update(&s_i_3v3_ema,  i_3v3)  : ema_value(&s_i_3v3_ema);
         float temp_ema   = ok_temp  ? ema_update(&s_temp_ema,   temp_c) : ema_value(&s_temp_ema);
+
+        /* Saturation / stuck-current watchdog. Fed only fresh reads: a
+         * skipped (capturing) or NACK'd sample has ok==false and is passed
+         * over, so the episode freezes instead of advancing on stale held
+         * EMAs or resetting on a transient I²C glitch. */
+        {
+            struct { sat_watch_t *w; bool ok; float i; float imax; const char *name; } sat[] = {
+                { &s_sat_12v,  ok_i_12v, i_12v,  INA226_IMAX_12V,  "12V"  },
+                { &s_sat_5v,   ok_i_5v,  i_5v,   INA226_IMAX_5V,   "5V"   },
+                { &s_sat_3v3,  ok_i_3v3, i_3v3,  INA226_IMAX_3V3,  "3V3"  },
+                { &s_sat_5vsb, ok_5vsb,  i_5vsb, INA226_IMAX_5VSB, "5VSB" },
+            };
+            for (size_t si = 0; si < sizeof(sat) / sizeof(sat[0]); si++) {
+                if (!sat[si].ok) continue;
+                sat_event_t ev = sat_watch_update(sat[si].w, sat[si].i, sat[si].imax);
+                if (ev == SAT_EVT_WARN) {
+                    ESP_LOGW(TAG, "SATURATION on %s: current pinned at %.2f A "
+                                  "(full scale %.2f A) for %.1f s — sustained "
+                                  "over-current or a railed/faulty INA226; "
+                                  "check or replace the module",
+                             sat[si].name, sat[si].i, sat[si].imax,
+                             sat[si].w->count * (SAMPLE_PERIOD_MS / 1000.0f));
+                } else if (ev == SAT_EVT_RECOVERED) {
+                    ESP_LOGI(TAG, "SATURATION on %s cleared (now %.2f A)",
+                             sat[si].name, sat[si].i);
+                }
+            }
+        }
 
         /* Total main-rail power, EMA-smoothed. 5VSB is standby and not
          * included by design (matches v0.5.9). */
