@@ -11,8 +11,7 @@
 #include "esp_log.h"
 #include "esp_check.h"
 #include "driver/usb_serial_jtag.h"
-#include "esp_vfs_usb_serial_jtag.h"
-#include "esp_vfs_dev.h"
+#include "driver/usb_serial_jtag_vfs.h"   /* IDF 6.0: was esp_vfs_usb_serial_jtag.h */
 #include "cec_cli.h"
 
 static const char *TAG = "cec_cli";
@@ -128,7 +127,7 @@ esp_err_t cec_cli_init(const cec_cli_command_t *commands, size_t count)
     usb_serial_jtag_driver_config_t cfg = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
     ESP_RETURN_ON_ERROR(usb_serial_jtag_driver_install(&cfg),
                         TAG, "usb_serial_jtag_driver_install");
-    esp_vfs_usb_serial_jtag_use_driver();
+    usb_serial_jtag_vfs_use_driver();   /* IDF 6.0 rename of esp_vfs_usb_serial_jtag_use_driver */
     /* Line-buffer stdin so reads complete on each '\n'. */
     setvbuf(stdin, NULL, _IOLBF, CLI_LINE_BUF_SIZE);
 
