@@ -9,6 +9,7 @@
 #include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "cec_teleplot.h"
 #include "cec_capture.h"
 
 static const char *TAG = "cec_capture";
@@ -138,16 +139,16 @@ static void dump_pretrigger(uint8_t state_at_trigger)
         int idx = (start + i) % PRE_TRIGGER_BUF_SIZE;
         const cec_capture_sample_t *p = &s_pre_buf[idx];
         unsigned ts = (unsigned)p->ts_ms;
-        printf(">b_v_12v:%u:%.3f\n",  ts, p->v_12v);
-        printf(">b_i_12v:%u:%.3f\n",  ts, p->i_12v);
-        printf(">b_v_5v:%u:%.3f\n",   ts, p->v_5v);
-        printf(">b_i_5v:%u:%.3f\n",   ts, p->i_5v);
-        printf(">b_v_3v3:%u:%.3f\n",  ts, p->v_3v3);
-        printf(">b_i_3v3:%u:%.3f\n",  ts, p->i_3v3);
-        printf(">b_v_5vsb:%u:%.3f\n", ts, p->v_5vsb);
-        printf(">b_i_5vsb:%u:%.4f\n", ts, p->i_5vsb);
-        printf(">b_temp:%u:%.2f\n",   ts, p->temp_c);
-        printf(">b_state:%u:%d\n",    ts, (int)p->state);
+        teleplot_writef(">b_v_12v:%u:%.3f\n",  ts, p->v_12v);
+        teleplot_writef(">b_i_12v:%u:%.3f\n",  ts, p->i_12v);
+        teleplot_writef(">b_v_5v:%u:%.3f\n",   ts, p->v_5v);
+        teleplot_writef(">b_i_5v:%u:%.3f\n",   ts, p->i_5v);
+        teleplot_writef(">b_v_3v3:%u:%.3f\n",  ts, p->v_3v3);
+        teleplot_writef(">b_i_3v3:%u:%.3f\n",  ts, p->i_3v3);
+        teleplot_writef(">b_v_5vsb:%u:%.3f\n", ts, p->v_5vsb);
+        teleplot_writef(">b_i_5vsb:%u:%.4f\n", ts, p->i_5vsb);
+        teleplot_writef(">b_temp:%u:%.2f\n",   ts, p->temp_c);
+        teleplot_writef(">b_state:%u:%d\n",    ts, (int)p->state);
     }
     /* state_at_trigger is logged via BURST_BEGIN; keep parameter for
      * future use (e.g. annotating the trigger sample). */
@@ -160,12 +161,12 @@ static void dump_hs(int64_t hs_start_us)
     for (int i = 0; i < HS_BURST_BUF_SIZE; i++) {
         const cec_capture_hs_sample_t *s = &s_hs_buf[i];
         unsigned ts = (unsigned)(hs_start_ms + (s->ts_us_offset / 1000));
-        printf(">hs_v_12v:%u:%.3f\n", ts, s->v_12v);
-        printf(">hs_i_12v:%u:%.3f\n", ts, s->i_12v);
-        printf(">hs_v_5v:%u:%.3f\n",  ts, s->v_5v);
-        printf(">hs_i_5v:%u:%.3f\n",  ts, s->i_5v);
-        printf(">hs_v_3v3:%u:%.3f\n", ts, s->v_3v3);
-        printf(">hs_i_3v3:%u:%.3f\n", ts, s->i_3v3);
+        teleplot_writef(">hs_v_12v:%u:%.3f\n", ts, s->v_12v);
+        teleplot_writef(">hs_i_12v:%u:%.3f\n", ts, s->i_12v);
+        teleplot_writef(">hs_v_5v:%u:%.3f\n",  ts, s->v_5v);
+        teleplot_writef(">hs_i_5v:%u:%.3f\n",  ts, s->i_5v);
+        teleplot_writef(">hs_v_3v3:%u:%.3f\n", ts, s->v_3v3);
+        teleplot_writef(">hs_i_3v3:%u:%.3f\n", ts, s->i_3v3);
     }
 }
 
@@ -215,17 +216,17 @@ static void hs_capture_task(void *arg)
                  (long long)(hs_end_us - hs_start_us),
                  zero_artifacts, HS_BURST_BUF_SIZE);
 
-        printf(">BURST_BEGIN:%s:%d_normal+%d_hs:%d\n",
-               cec_trigger_name(reason),
-               s_pre_count, HS_BURST_BUF_SIZE,
-               (int)state_at_trigger);
+        teleplot_writef(">BURST_BEGIN:%s:%d_normal+%d_hs:%d\n",
+                        cec_trigger_name(reason),
+                        s_pre_count, HS_BURST_BUF_SIZE,
+                        (int)state_at_trigger);
         if (s_pending_annotation[0] != '\0') {
-            printf(">BURST_ANNOTATION:%s\n", s_pending_annotation);
+            teleplot_writef(">BURST_ANNOTATION:%s\n", s_pending_annotation);
             s_pending_annotation[0] = '\0';
         }
         dump_pretrigger(state_at_trigger);
         dump_hs(hs_start_us);
-        printf(">BURST_END\n");
+        teleplot_writef(">BURST_END\n");
 
         s_last_complete_us = esp_timer_get_time();
         s_busy = false;

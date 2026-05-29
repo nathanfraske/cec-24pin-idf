@@ -19,12 +19,17 @@ cec-24pin-idf/
 │   ├── CMakeLists.txt          Main component config
 │   └── main.c                  Entry point (app_main)
 └── components/
-    ├── cec_sensors/            Hardware abstractions: INA226, ACS712, NTC
-    ├── cec_detection/          State classifier, swing detectors, profiles
-    └── cec_capture/            Burst capture engine, pre-trigger buffer
+    ├── cec_common/             Shared enums (cec_state_t, cec_severity_t)
+    ├── cec_filters/            EMA + rolling-median primitives
+    ├── cec_nvs/                Thin NVS save/load/clear blob wrapper
+    ├── cec_sensors/            Hardware abstractions: INA226, ACS712, NTC, ADC1
+    ├── cec_detection/          State classifier, Layer 1/2/3, swing detectors
+    ├── cec_capture/            Burst capture engine, pre-trigger ring
+    ├── cec_telemetry/          TelePlot output helpers
+    └── cec_cli/                Line-based serial command interface
 ```
 
-Component-based layout is intentional. Each component is hardware-agnostic where possible so it can be reused in the planned ESP32-P4 firmware for the 12VHPWR module.
+Component-based layout is intentional. Each component is hardware-agnostic where possible so it can be reused in the planned ESP32-P4 firmware for the 12VHPWR module, and the small headers-only components (`cec_common`, `cec_filters`) are explicitly shaped to be vendored unchanged into the sibling [`cec-eps-idf`](https://github.com/nathanfraske/cec-eps-idf) repo.
 
 ## Build
 
@@ -66,14 +71,28 @@ Tracking the port progress from Arduino-ESP32 v0.5.9 to ESP-IDF:
 | Layer 3 (Z-score anomaly) | Done |
 | Power-swing detector | Done |
 | Current-swing detector | Done |
-| Burst capture engine | Done (non-blocking, oneshot ADC; DMA path pending) |
+| Burst capture engine | Done (non-blocking; HS reads the continuous-mode cache) |
 | NVS profile storage | Done |
 | Serial command interface | Done (burst / set / status; ACS712 cal deferred — moving to INA226s) |
 | Shutdown detection + mute window | Done |
 
+Deferred work — EPS-parity items, a code-review cleanup (lint) list, and the
+hardware-driven INA226 swap — is tracked in [FOLLOWUPS.md](FOLLOWUPS.md).
+
 ## Behavior parity check
 
 Once each component lands, run side-by-side captures against the v0.5.9 baseline on the same PSU and same workloads, and compare the resulting bursts. Any divergence beyond measurement noise is a porting bug to track down before that component is considered done.
+
+## Serial topology
+
+Two USB-C ports carry firmware output on the 24-pin board, matching the layout used by `cec-eps-idf`:
+
+| Port | Transport | Content | Baud |
+|---|---|---|---|
+| **JTAG USB-C** | Native ESP32-S3 USB Serial-JTAG | CLI input, `ESP_LOG` output, command responses, boot banner | host-side default (CDC) |
+| **UART USB-C** | CH340K bridge to UART0 (GPIO 43 TX / 44 RX) | All TelePlot lines — 10 Hz steady-state telemetry plus `>BURST_BEGIN ... >BURST_END` dumps | 921600 |
+
+Splitting the streams keeps the heavy traffic (~600 KB per burst at full fidelity) off the same wire that's carrying CLI input. `cec_telemetry` owns the UART side; `teleplot_emit*` / `teleplot_writef` calls route through `uart_write_bytes` once `cec_telemetry_init_uart()` has run, with an automatic stdio fallback if the UART driver can't come up (e.g. the secondary cable isn't plugged in during dev).
 
 ## API migration reference
 
