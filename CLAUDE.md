@@ -73,11 +73,30 @@ Non-blocking: a Core-1 task captures while the Core-0 main loop keeps running.
 HS path reconfigures the 3 main-rail INA226s to fast mode (`INA226_CONFIG_HS`
 = 0x4007, ~140 µs conversions) for the window, captures **current at 1 kHz**
 and **voltage decimated to ~100 Hz** (fits the 400 kHz I2C budget), then
-restores steady mode (0x4527). The main loop coasts on held EMAs while a burst
-is in progress (`!cec_capture_is_busy()` gates sensor reads, the pre-trigger
-push, steady TelePlot, and NVS saves) to keep off the shared I2C bus and the
-TelePlot UART. Fast-mode-Plus (1 MHz I2C) for HS voltage at full 1 kHz is a
-deferred option gated on a pull-up fix — see FOLLOWUPS.
+restores steady mode (0x4527).
+
+The engine exposes **two phase flags** so the main loop blocks only what each
+phase actually contends for:
+
+- `cec_capture_is_capturing()` — true during the 4 s HS window. Main-loop
+  sensor reads and the pre-trigger push gate on this (I²C bus owned by the
+  HS task; EMAs are also held since reads are skipped).
+- `cec_capture_is_dumping()` — true during the post-capture TelePlot stream
+  (~5 s). Steady TelePlot and the pre-trigger push gate on this (UART owned
+  by the dump; ring is being read).
+- `cec_capture_is_busy()` — true for either phase. NVS saves gate on this
+  (flash erase/write stalls both cores' cache).
+
+Reads / EMAs / detectors **do** run during the dumping phase — the bus is
+idle then, so detection coverage is preserved through ~half of the burst.
+This was a deliberate split (was previously gated as one big "busy" phase
+and lost ~9 s of monitoring per burst).
+
+The HS sample callback returns a **per-rail success bitmask**
+(`CEC_HS_OK_*`); the engine carries each absent bit forward independently
+so one bad device can't void healthy rails. Fast-mode-Plus (1 MHz I²C) for
+HS voltage at full 1 kHz is a deferred option gated on a pull-up fix — see
+FOLLOWUPS.
 
 ## Working conventions
 
@@ -96,10 +115,21 @@ deferred option gated on a pull-up fix — see FOLLOWUPS.
 ## Current state
 
 - v1 → ESP-IDF port complete and field-validated; full detection stack done.
-- **PR #8 open**: v2 sensor block (4× INA226), IDF-6.0 build fix, boot I2C
+- **PR #8 open**: v2 sensor block (4× INA226), IDF-6.0 build fix, boot I²C
   scan, the address swap + current-sign inversion above. Bring-up debugging
   done over chat (addressing/jumpers/wiring); all four INA226 now enumerate.
-- Next once a PSU is connected: validate live V/I per rail (currents should
-  read positive under load after the sign flip), confirm a burst dumps clean.
-- Deferred: daughterboard NTC + CAN; lint items L2–L6; 1 MHz HS voltage.
-  All in `FOLLOWUPS.md`.
+  Latest commits on the branch address findings from a live-capture
+  analysis: per-rail HS bitmask (one bad rail no longer voids the other
+  two), 5VSB EMA re-prime on `OFF→STANDBY` (kills the spurious Layer 1
+  CRITICAL at PSU-plug-in), and a `capturing`/`dumping` phase split that
+  recovers ~5 s of monitoring coverage per burst.
+- Open hardware issue: the 0x41 INA226 NACKs intermittently under load —
+  almost certainly the v2 spec §6 parallel-pull-up problem. User is
+  reworking the joints / pull-ups. Firmware escape hatch: drop
+  `INA226_SCL_HZ` from 400 000 to 100 000 in `main.c`.
+- Next once a PSU is connected and 0x41 is reliable: validate live V/I per
+  rail (currents should read positive under load after the sign flip),
+  confirm a burst dumps clean, verify the new phase split actually keeps
+  the slow loop alive through a dump.
+- Deferred: shutdown-detect debounce (analyzer C5); daughterboard NTC + CAN;
+  lint items L2/L3/L4/L6; 1 MHz HS voltage. All in `FOLLOWUPS.md`.

@@ -534,18 +534,19 @@ static void hs_teardown_fn(void)
 
 /* HS sample callback at 1 kHz on the capture task. Current (shunt) on the
  * 3 main rails every sample; bus voltage only when want_voltage (~100 Hz)
- * so the I2C budget stays inside 1 ms at 400 kHz. Returns false if any
- * read failed so the engine can carry the previous sample forward. */
-static bool hs_sample_fn(cec_capture_hs_sample_t *out, bool want_voltage)
+ * so the I2C budget stays inside 1 ms at 400 kHz. Returns a per-rail
+ * success bitmask — the engine carries forward each unset bit separately
+ * so one device's NACK can't void healthy rails. */
+static uint32_t hs_sample_fn(cec_capture_hs_sample_t *out, bool want_voltage)
 {
-    bool ok = true;
-    ok &= (ina226_read_current(s_ina226_12v, &out->i_12v) == ESP_OK);
-    ok &= (ina226_read_current(s_ina226_5v,  &out->i_5v)  == ESP_OK);
-    ok &= (ina226_read_current(s_ina226_3v3, &out->i_3v3) == ESP_OK);
+    uint32_t ok = 0;
+    if (ina226_read_current(s_ina226_12v, &out->i_12v) == ESP_OK) ok |= CEC_HS_OK_I_12V;
+    if (ina226_read_current(s_ina226_5v,  &out->i_5v)  == ESP_OK) ok |= CEC_HS_OK_I_5V;
+    if (ina226_read_current(s_ina226_3v3, &out->i_3v3) == ESP_OK) ok |= CEC_HS_OK_I_3V3;
     if (want_voltage) {
-        ok &= (ina226_read_bus_voltage(s_ina226_12v, &out->v_12v) == ESP_OK);
-        ok &= (ina226_read_bus_voltage(s_ina226_5v,  &out->v_5v)  == ESP_OK);
-        ok &= (ina226_read_bus_voltage(s_ina226_3v3, &out->v_3v3) == ESP_OK);
+        if (ina226_read_bus_voltage(s_ina226_12v, &out->v_12v) == ESP_OK) ok |= CEC_HS_OK_V_12V;
+        if (ina226_read_bus_voltage(s_ina226_5v,  &out->v_5v)  == ESP_OK) ok |= CEC_HS_OK_V_5V;
+        if (ina226_read_bus_voltage(s_ina226_3v3, &out->v_3v3) == ESP_OK) ok |= CEC_HS_OK_V_3V3;
     }
     return ok;
 }
@@ -801,24 +802,28 @@ void app_main(void)
         bool ok_v_12v = false, ok_v_5v = false, ok_v_3v3 = false;
         bool ok_i_12v = false, ok_i_5v = false, ok_i_3v3 = false;
 
-        /* All four rails are INA226 over I2C. Skip reads entirely while a
-         * burst runs: the 3 main-rail devices are in fast HS mode then and
-         * the HS task owns the bus, so we coast on the last-good EMAs until
-         * the capture completes. */
-        bool busy = cec_capture_is_busy();
-        if (!busy && s_ina226_12v) {
+        /* Capture-phase gating. During CAPTURING (HS window): the 3 main
+         * rails are in fast mode and the HS task owns I2C, so coast on
+         * held EMAs. During DUMPING: the I2C bus is idle - reads, EMAs,
+         * and detectors all run normally; only steady-state TelePlot
+         * emission stays silent because the capture task owns the UART.
+         * Splitting the gate this way recovers ~5 s of monitoring
+         * coverage per burst vs. blanking on any cec_capture_is_busy(). */
+        bool capturing = cec_capture_is_capturing();
+        bool dumping   = cec_capture_is_dumping();
+        if (!capturing && s_ina226_12v) {
             ok_v_12v = (ina226_read_bus_voltage(s_ina226_12v, &v_12v) == ESP_OK);
             ok_i_12v = (ina226_read_current(s_ina226_12v, &i_12v) == ESP_OK);
         }
-        if (!busy && s_ina226_5v) {
+        if (!capturing && s_ina226_5v) {
             ok_v_5v = (ina226_read_bus_voltage(s_ina226_5v, &v_5v) == ESP_OK);
             ok_i_5v = (ina226_read_current(s_ina226_5v, &i_5v) == ESP_OK);
         }
-        if (!busy && s_ina226_3v3) {
+        if (!capturing && s_ina226_3v3) {
             ok_v_3v3 = (ina226_read_bus_voltage(s_ina226_3v3, &v_3v3) == ESP_OK);
             ok_i_3v3 = (ina226_read_current(s_ina226_3v3, &i_3v3) == ESP_OK);
         }
-        if (!busy && s_ina226_5vsb) {
+        if (!capturing && s_ina226_5vsb) {
             ok_5vsb = (ina226_read_bus_voltage(s_ina226_5vsb, &v_5vsb) == ESP_OK &&
                        ina226_read_current(s_ina226_5vsb, &i_5vsb) == ESP_OK);
         }
@@ -907,6 +912,20 @@ void app_main(void)
                 reset_swing_windows();
                 reset_v_12v_history();
                 s_z_above_last = false;
+            }
+            /* 5VSB powers up at OFF -> {STANDBY,IDLE+}, not at the main-
+             * rails-up transition. Re-prime its EMA pair so the next
+             * sample jumps from 0 V to the actual ~5 V instead of crawling
+             * up at alpha=0.02 (~1 s tau) for seconds and tripping Layer 1
+             * CRITICAL halfway through. The full reset above already
+             * covers 5VSB on STANDBY -> IDLE, so this only matters for
+             * the OFF -> STANDBY edge but is also harmlessly redundant on
+             * a direct OFF -> IDLE. */
+            if (s_state == CEC_STATE_OFF && next_state != CEC_STATE_OFF) {
+                ema_reset(&s_v_5vsb_ema);
+                ema_reset(&s_i_5vsb_ema);
+                cec_layer1_reset(&s_l1_5vsb);
+                s_last_sev_5vsb = CEC_SEV_NONE;
             }
             /* Landing in OFF or STANDBY means the shutdown sequence
              * resolved (PSU unplugged → OFF, switched off → STANDBY).
@@ -1101,9 +1120,10 @@ void app_main(void)
 
         /* Periodic NVS save. Only run if profiles got dirty since the
          * last save, and only every NVS_SAVE_INTERVAL_US to limit flash
-         * wear. Never during a burst: the flash write disables cache on
-         * both cores and would wreck the HS capture timing on Core 1. */
-        if (!busy && s_profiles_dirty
+         * wear. Never during ANY burst phase: the flash write disables
+         * cache on both cores and would wreck either HS capture timing
+         * (capturing) or UART streaming (dumping). */
+        if (!capturing && !dumping && s_profiles_dirty
             && (esp_timer_get_time() - s_last_nvs_save_us) > NVS_SAVE_INTERVAL_US) {
             esp_err_t err = cec_nvs_save_blob(NVS_PROFILES_KEY, NVS_PROFILES_MAGIC,
                                               s_profiles, sizeof(s_profiles));
@@ -1121,11 +1141,11 @@ void app_main(void)
         }
 
         /* Push a pre-trigger sample every iteration so the ring buffer
-         * always holds the last ~20 s of filtered telemetry. Skip while a
-         * burst is in progress: the values are held/stale then, and the
-         * ring is being dumped by the capture task — we don't want to
-         * overwrite the captured context with duplicates. */
-        if (!busy) {
+         * always holds the last ~20 s of filtered telemetry. Skip during
+         * CAPTURING (EMAs are held/stale, no fresh data) and during
+         * DUMPING (the capture task is reading the ring; we'd overwrite
+         * the captured context). */
+        if (!capturing && !dumping) {
             cec_capture_sample_t pre = {
                 .ts_ms  = (uint32_t)(esp_timer_get_time() / 1000),
                 .state  = (uint8_t)s_state,
@@ -1138,11 +1158,12 @@ void app_main(void)
             cec_capture_push(&pre);
         }
 
-        /* Steady-state TelePlot, gated on !busy: the capture task owns the
-         * TelePlot UART during a burst dump, so the main loop must stay off
-         * it or it would inject stray rows into the >BURST_BEGIN..END
-         * envelope. */
-        if (!busy && iter % TELEPLOT_DIVIDER == 0) {
+        /* Steady-state TelePlot stays gated on any burst phase. During
+         * CAPTURING the EMAs hold their pre-capture values (sensor reads
+         * were skipped above) — emitting those for 4 s would be flatlined
+         * stale rows that misrepresent freshness. During DUMPING the
+         * capture task owns the UART. */
+        if (!capturing && !dumping && iter % TELEPLOT_DIVIDER == 0) {
             /* Use the device-side millisecond clock for every TelePlot
              * row so the slow-loop output shares a time base with the
              * burst-capture b_*hs_* streams. Without this TelePlot

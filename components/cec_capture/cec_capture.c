@@ -52,7 +52,12 @@ static cec_capture_hs_hook_fn_t   s_hs_teardown_fn = NULL;
 static SemaphoreHandle_t s_trigger_sem = NULL;
 static TaskHandle_t s_hs_task = NULL;
 
-static volatile bool s_busy = false;
+typedef enum {
+    CAP_IDLE = 0,
+    CAP_CAPTURING,   /* 4 s HS window, capture task hot-polling I2C */
+    CAP_DUMPING,     /* post-capture TelePlot streaming over UART */
+} cec_cap_phase_t;
+static volatile cec_cap_phase_t s_phase = CAP_IDLE;
 static volatile cec_trigger_t s_pending_reason = CEC_TRIG_NONE;
 static volatile int64_t s_last_complete_us = 0;
 static volatile bool s_inited = false;
@@ -88,15 +93,14 @@ void cec_capture_push(const cec_capture_sample_t *s)
     if (s_pre_count < PRE_TRIGGER_BUF_SIZE) s_pre_count++;
 }
 
-bool cec_capture_is_busy(void)
-{
-    return s_busy;
-}
+bool cec_capture_is_busy(void)     { return s_phase != CAP_IDLE; }
+bool cec_capture_is_capturing(void) { return s_phase == CAP_CAPTURING; }
+bool cec_capture_is_dumping(void)   { return s_phase == CAP_DUMPING; }
 
 esp_err_t cec_capture_trigger_with_text(cec_trigger_t reason, const char *text)
 {
-    if (!s_inited) return ESP_ERR_INVALID_STATE;
-    if (s_busy)    return ESP_ERR_NOT_FINISHED;
+    if (!s_inited)           return ESP_ERR_INVALID_STATE;
+    if (s_phase != CAP_IDLE) return ESP_ERR_NOT_FINISHED;
 
     int64_t now = esp_timer_get_time();
     bool bypass_cooldown = (reason == CEC_TRIG_SHUTDOWN);
@@ -105,7 +109,7 @@ esp_err_t cec_capture_trigger_with_text(cec_trigger_t reason, const char *text)
         return ESP_ERR_INVALID_STATE;
     }
 
-    s_busy = true;
+    s_phase = CAP_CAPTURING;
     s_pending_reason = reason;
     if (text != NULL && text[0] != '\0') {
         /* strncpy + explicit NUL — we own the buffer, so we don't care
@@ -210,38 +214,51 @@ static void hs_capture_task(void *arg)
 
         int64_t hs_start_us = esp_timer_get_time();
         int64_t target_us = hs_start_us;
-        int carried = 0;
+        int slots_with_carry = 0;
         for (int i = 0; i < HS_BURST_BUF_SIZE; i++) {
             target_us += HS_SAMPLE_INTERVAL_US;
             spin_until(target_us);
             cec_capture_hs_sample_t *s = &s_hs_buf[i];
             s->ts_us_offset = (uint32_t)(esp_timer_get_time() - hs_start_us);
             bool want_voltage = (i % HS_VOLTAGE_DECIMATE == 0);
-            bool ok = s_hs_fn(s, want_voltage);
+            uint32_t ok = s_hs_fn(s, want_voltage);
 
-            /* On a failed I2C read, carry the previous sample forward so
-             * the stream stays continuous instead of dropping to zero.
-             * Shows as a flat-line if a real collapse coincides — rare
-             * and easy to spot. */
-            if (!ok && i > 0) {
-                const cec_capture_hs_sample_t *prev = &s_hs_buf[i - 1];
-                s->v_12v = prev->v_12v; s->i_12v = prev->i_12v;
-                s->v_5v  = prev->v_5v;  s->i_5v  = prev->i_5v;
-                s->v_3v3 = prev->v_3v3; s->i_3v3 = prev->i_3v3;
-                carried++;
+            /* Per-rail carry-forward. The fields the callback was expected
+             * to fill this iteration are CEC_HS_OK_ALL_I always plus
+             * CEC_HS_OK_ALL_V on decimated samples. Any expected field not
+             * marked OK gets the previous sample's value; healthy rails
+             * are untouched, so one device's NACK can no longer void the
+             * other two. */
+            if (i > 0) {
+                uint32_t expected = CEC_HS_OK_ALL_I | (want_voltage ? CEC_HS_OK_ALL_V : 0u);
+                uint32_t missing  = expected & ~ok;
+                if (missing) {
+                    const cec_capture_hs_sample_t *prev = &s_hs_buf[i - 1];
+                    if (missing & CEC_HS_OK_I_12V) s->i_12v = prev->i_12v;
+                    if (missing & CEC_HS_OK_V_12V) s->v_12v = prev->v_12v;
+                    if (missing & CEC_HS_OK_I_5V)  s->i_5v  = prev->i_5v;
+                    if (missing & CEC_HS_OK_V_5V)  s->v_5v  = prev->v_5v;
+                    if (missing & CEC_HS_OK_I_3V3) s->i_3v3 = prev->i_3v3;
+                    if (missing & CEC_HS_OK_V_3V3) s->v_3v3 = prev->v_3v3;
+                    slots_with_carry++;
+                }
             }
         }
         int64_t hs_end_us = esp_timer_get_time();
 
-        /* Restore steady conversion mode before the (slow) dump. */
+        /* Restore steady conversion mode. After this returns the I2C bus
+         * is idle until the next iteration of this task — so we drop the
+         * capturing flag and let the main loop resume its own reads even
+         * though the dump is about to take ~5 s over the UART. */
         if (s_hs_teardown_fn != NULL) {
             s_hs_teardown_fn();
         }
+        s_phase = CAP_DUMPING;
 
-        ESP_LOGI(TAG, "HS capture done in %lld us (carried-forward: %d/%d), "
+        ESP_LOGI(TAG, "HS capture done in %lld us (slots with carry-forward: %d/%d), "
                       "dumping pre+HS to TelePlot",
                  (long long)(hs_end_us - hs_start_us),
-                 carried, HS_BURST_BUF_SIZE);
+                 slots_with_carry, HS_BURST_BUF_SIZE);
 
         teleplot_writef(">BURST_BEGIN:%s:%d_normal+%d_hs:%d\n",
                         cec_trigger_name(reason),
@@ -256,7 +273,7 @@ static void hs_capture_task(void *arg)
         teleplot_writef(">BURST_END\n");
 
         s_last_complete_us = esp_timer_get_time();
-        s_busy = false;
+        s_phase = CAP_IDLE;
         ESP_LOGI(TAG, "burst complete");
     }
 }

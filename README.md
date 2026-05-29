@@ -62,7 +62,7 @@ Tracking the port progress from Arduino-ESP32 v0.5.9 to ESP-IDF:
 | EMA / median filter primitives | Done |
 | Sample loop at 50 Hz | Done |
 | Teleplot output (dual-stream UART) | Done |
-| Burst capture engine | Done (non-blocking, 1 kHz HS) |
+| Burst capture engine | Done (non-blocking, 1 kHz HS; phase-split gating preserves detection during dump) |
 | NVS profile storage | Done |
 | Serial command interface | Done (burst / set / status) |
 
