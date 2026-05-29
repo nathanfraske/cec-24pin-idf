@@ -66,6 +66,10 @@ re-derive the analysis when the trigger fires.
 
 ### F1 — Continuous 1 kHz rolling buffer (pre-trigger HS data)
 
+> **Design spec:** [`design/F1_continuous_hs.md`](design/F1_continuous_hs.md)
+> — full API surface, data shapes, task model, migration order. Read that
+> when implementation lands; the bullets below are the elevator pitch.
+
 **What we don't have today.** The HS buffer starts *at the trigger moment*.
 Pre-trigger context is 50 Hz only (20 s of EMA-filtered samples). So a burst
 shows us 4 s of 1 kHz aftermath but zero kHz history — for a fault whose

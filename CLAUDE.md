@@ -2,9 +2,12 @@
 
 Context for an agent picking up this project. Read this first, then
 `README.md` (architecture / build / hardware revisions) and `FOLLOWUPS.md`
-(deferred work + known-issue lint list). The Arduino-ESP32 v0.5.9 firmware
-is the behavioral reference for the port; a v1→v2 hardware change spec was
-provided during development.
+(deferred work + known-issue lint list). Substantial deferred features
+that have already been designed live in `design/` (currently:
+`F1_continuous_hs.md` — the continuous 1 kHz INA226 streamer); read
+those at implementation time rather than re-deriving the API. The
+Arduino-ESP32 v0.5.9 firmware is the behavioral reference for the
+port; a v1→v2 hardware change spec was provided during development.
 
 ## What this is
 
@@ -133,3 +136,11 @@ FOLLOWUPS.
   the slow loop alive through a dump.
 - Deferred: shutdown-detect debounce (analyzer C5); daughterboard NTC + CAN;
   lint items L2/L3/L4/L6; 1 MHz HS voltage. All in `FOLLOWUPS.md`.
+- **F1 designed, not built** — continuous 1 kHz INA226 streamer for
+  pre-trigger HS data. Implementation spec in
+  [`design/F1_continuous_hs.md`](design/F1_continuous_hs.md); deferred
+  until the 0x41 hardware is stable and a real fault capture demonstrates
+  the need. Would also fold in FOLLOWUPS L2 (kills the HS task's
+  watchdog-margin spin) and remove the burst-engine's setup/teardown
+  hooks. F2 (deferred-burst streaming) shares infrastructure; design it
+  alongside if both land.
