@@ -44,11 +44,10 @@ detection layers → burst triggers, with TelePlot at 10 Hz and an INFO log at
 
 - **All four rails are INA226** on I2C0 (SDA=GPIO8, SCL=GPIO9, 400 kHz). v1's
   ADC voltage-divider taps and ACS712 current sensors are gone.
-- **Address → rail map is BOARD-SPECIFIC** and differs from the v2 spec
-  because of how this unit was jumpered. Authoritative (see `main.c`):
+- **Address → rail map** (matches v2 spec; see `main.c`):
   - `0x40` → 12V (0.002 Ω)
-  - `0x41` → 3.3V (0.025 Ω)   ← spec said 5V; swapped on this board
-  - `0x44` → 5V (0.010 Ω)     ← spec said 3.3V; swapped on this board
+  - `0x41` → 5V (0.010 Ω)
+  - `0x44` → 3.3V (0.025 Ω)
   - `0x45` → 5VSB (0.025 Ω)
 - **Every rail's current is sign-inverted** (`INA226_ITRIM_* = -1.0`) because
   all four shunt terminals were wired backwards. The flip happens inside

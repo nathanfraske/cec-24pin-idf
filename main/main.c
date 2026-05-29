@@ -59,10 +59,8 @@ static const char *TAG = "cec_main";
  *
  *   addr  rail    R_shunt   full-scale   (CAL computes to 2048 for all)
  *   0x40  +12V    0.002 R   40.96 A
- *   0x41  +3.3V   0.025 R    3.28 A      (was 5V in the v2 spec; address
- *                                         swapped here to match how this
- *                                         board was physically jumpered)
- *   0x44  +5V     0.010 R    8.19 A      (was 3.3V in the v2 spec; swap)
+ *   0x41  +5V     0.010 R    8.19 A
+ *   0x44  +3.3V   0.025 R    3.28 A
  *   0x45  +5VSB   0.025 R    3.28 A      (moved from 0x40 in v1)
  *
  * Current is read in software (shunt uV / R_shunt) so the non-standard
@@ -70,8 +68,8 @@ static const char *TAG = "cec_main";
  * (1.25 mV LSB) at the PSU side of each Kelvin shunt. Trims start at 1.0;
  * adjust per-rail against a meter if bench calibration shows drift. */
 #define INA226_ADDR_12V      0x40
-#define INA226_ADDR_3V3      0x41   /* board-specific: 3.3V module is at 0x41 */
-#define INA226_ADDR_5V       0x44   /* board-specific: 5V module is at 0x44 */
+#define INA226_ADDR_5V       0x41
+#define INA226_ADDR_3V3      0x44
 #define INA226_ADDR_5VSB     0x45
 
 #define INA226_SHUNT_12V     0.002f
