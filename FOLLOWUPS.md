@@ -55,3 +55,124 @@ The shared daughterboard isn't built for this module yet. When the pigtail lands
   the full 1 kHz alongside current. Gated on the §6 pull-up fix (lift 3 of the
   4 module pull-ups) holding up at speed — check for garbage on the inputs
   before trusting it. Today HS voltage is decimated to ~100 Hz at 400 kHz.
+
+## Future architectural ideas (not committed — write-ups for later decisions)
+
+These are real options, sized and reasoned-through, that aren't being built
+now because their cost outweighs their current value. Each entry captures
+the shape, the math, the downsides, and the trigger that would justify
+elevating it to actual work — so a future agent (or you) doesn't have to
+re-derive the analysis when the trigger fires.
+
+### F1 — Continuous 1 kHz rolling buffer (pre-trigger HS data)
+
+**What we don't have today.** The HS buffer starts *at the trigger moment*.
+Pre-trigger context is 50 Hz only (20 s of EMA-filtered samples). So a burst
+shows us 4 s of 1 kHz aftermath but zero kHz history — for a fault whose
+*cause* is a sub-50 Hz transient (microsecond load steps, switching
+artifacts), the trigger lag means we capture the consequence and miss the
+trigger event itself.
+
+**Shape.** Replace the per-burst HS task with a *continuous* sampler task
+that keeps the 3 main-rail INA226s permanently in fast mode (AVG=1, 140 µs
+conversions, `INA226_CONFIG_HS`) and writes a **rolling ring of the last
+~2–4 s of 1 kHz current samples** (and decimated voltage). The main loop
+stops reading I²C itself — it reads the latest slot from the rolling buffer
+each iteration. On a trigger:
+
+1. Snapshot the rolling ring into a per-burst buffer (pre-trigger HS).
+2. Snapshot the existing 50 Hz pre-trigger ring (unchanged — wider context).
+3. Capture an additional 4 s of 1 kHz samples post-trigger (same as today).
+4. Dump all three over TelePlot.
+
+**Memory.** Rolling ring at 2 s = 56 KB, at 4 s = 112 KB. Existing buffers
+total ~160 KB. With 8 MB PSRAM the absolute number is irrelevant; if the
+ring lives in SRAM the total stays well under the N16R8's budget. Honest
+cost: small.
+
+**The AVG=1 noise tradeoff.** Today the INA226s run at AVG=16
+(`INA226_CONFIG_STEADY`), which averages 16 raw samples per reported value
+and reduces per-sample noise by √16 = 4×. Moving to permanent AVG=1 means
+per-sample current noise rises 4×: ~1.25 mA RMS on the 12 V rail (0.002 Ω
+shunt), ~100 µA RMS on the 3V3/5VSB rails. *Downstream* this is absorbed by
+the EMA at α=0.02, which with 1 kHz feed averages ~1000 samples for its
+~1 s τ — so the 50 Hz consumer sees *more* smoothing than today, not less.
+HS analysis explicitly wants the per-sample variance. Probably a net win.
+
+**Side benefits.** Several real ones, not just the pre-trigger data:
+- **Fixes FOLLOWUPS L2** for free. The HS task's `taskYIELD`-spin
+  (~4 s of starving Core 1's idle task, ~80 % of the watchdog window) goes
+  away — a continuous sampler can `vTaskDelayUntil(pdMS_TO_TICKS(1))`
+  because it's not racing a 4 s window, just keeping a ring topped up.
+- **Removes the mode-switch settle gap.** Today the HS task does
+  `setup_fn → settle 2 ms → 4 s capture → teardown_fn`. With permanent fast
+  mode the setup/teardown hooks (and the 2 ms settle) disappear — the
+  burst-engine API simplifies, the `cec_capture_config_t.setup_fn`/
+  `teardown_fn` fields can be removed.
+- **No more "did the main loop and the HS task collide on I²C?"** Only the
+  sampler task touches the bus; everyone else reads the latest slot. The
+  `cec_capture_is_capturing()` gate on main-loop reads (and the whole
+  "phase split" we did in this PR) becomes unnecessary — `is_dumping` is
+  the only flag that matters (UART contention).
+- **Burst capture during a dump becomes possible.** Today
+  `cec_capture_trigger` rejects re-triggers while `s_phase != CAP_IDLE`,
+  because the single HS buffer is in use. With per-burst buffers (which
+  this design needs anyway), a second trigger could allocate another
+  buffer mid-dump. Pairs naturally with F2 below.
+
+**Downsides.** Permanent ~45% I²C bus utilization (3 reads × 1 kHz at 400
+kHz vs. today's bursty pattern). Continuous fast-mode is *slightly* more
+power. The AVG=1 noise needs to be re-validated against the detection-stack
+tuning (probably fine — the analysis findings to date show the layers
+handle real noise well). Bigger code change than fits in any of the
+current PRs.
+
+**Trigger to build it.** First real fault capture where the missing
+pre-trigger HS data prevents diagnosis (you see the aftermath at 1 kHz but
+can't tell *what caused* the L1/L2 fire). Until that's a concrete blocker
+the existing 50 Hz pre-trigger is doing the job for the slow-trend cases
+that have come up so far.
+
+### F2 — Deferred burst streaming with PSRAM queue and UART arbiter
+
+**Motivation.** During a fault storm (back-to-back bursts), each burst's
+~5 s dump silences live TelePlot output. The dump itself is fine — it's
+streaming useful data — but the steady traces pause for the storm's
+duration. Detection survives (post-phase-split), so this is a
+telemetry-continuity concern, not a correctness one. For offline-CSV
+workflows it's a non-issue (TelePlot reorders by embedded device timestamp
+on import); for live bench debug it's mildly annoying.
+
+**Shape.** A PSRAM-backed ring of captured-but-not-yet-dumped bursts plus
+a low-priority streamer task that drains the queue *opportunistically*,
+yielding to live telemetry. Steady output and queue-drain share the UART
+via a mutex in `cec_telemetry` (already cleanly factorable — `teleplot_writef`
+formats a whole line into a local buffer then does one `uart_write_bytes`;
+wrap that one call in a mutex for atomic lines).
+
+PSRAM math: a burst is ~160 KB (112 KB HS + a 48 KB pre-trigger snapshot —
+note the snapshot, F1 makes this mandatory anyway). A queue of 8 bursts is
+1.3 MB; 16 is 2.6 MB. The N16R8's 8 MB PSRAM is fine for either.
+
+**The Achilles heel — what if the system never stabilizes.** A dying PSU
+storms indefinitely, which is exactly when you most want the data and least
+get calm bandwidth. So "wait for stable, then stream" can't be the whole
+policy. The honest version is **queue-and-drain-opportunistically with a
+depth cap that forces a flush** — the streamer just runs whenever there's
+spare bandwidth and falls behind during storms / catches up during calm,
+and when the queue hits the cap it drains regardless. That softer framing
+*doesn't need a stability oracle at all* — sidesteps the "firmware has to
+detect stable" problem cleanly. A real stable/unstable gate is a refinement
+that can land later, not the foundation.
+
+**Trigger to build it.** You run real captures, hit a genuine fault storm,
+and find the repeated live-telemetry gaps actually impede analysis (vs.
+"slightly annoying"). Until then, the offline-CSV workflow makes this
+mostly invisible to you specifically.
+
+**Note: F1 and F2 share infrastructure.** Both need per-burst buffers
+(snapshot semantics), and the UART mutex is needed by F2 and would also
+unblock interleaving steady-telemetry rows mid-dump if that ever became
+desired. If both eventually land, build the per-burst-buffer + UART-mutex
+foundation once and let F1 and F2 sit on it.
+
