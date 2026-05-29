@@ -22,7 +22,7 @@ cec-24pin-idf/
     ├── cec_common/             Shared enums (cec_state_t, cec_severity_t)
     ├── cec_filters/            EMA + rolling-median primitives
     ├── cec_nvs/                Thin NVS save/load/clear blob wrapper
-    ├── cec_sensors/            Hardware abstractions: INA226, ACS712, NTC, ADC1
+    ├── cec_sensors/            INA226 (active); cec_adc + thermistor (dormant, NTC)
     ├── cec_detection/          State classifier, Layer 1/2/3, swing detectors
     ├── cec_capture/            Burst capture engine, pre-trigger ring
     ├── cec_telemetry/          TelePlot output helpers
