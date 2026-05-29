@@ -82,6 +82,10 @@ static const char *TAG = "cec_main";
 #define INA226_IMAX_3V3       3.28f
 #define INA226_IMAX_5VSB      3.28f
 
+/* Per-device I2C clock. 400 kHz per the v2 spec; drop to 100000 if the
+ * four parallel breakout pull-ups make the bus marginal (spec section 6). */
+#define INA226_SCL_HZ        400000
+
 /* NTC thermistor lives on ADC1_CH6 (GPIO7) on the shared daughterboard,
  * which is not built yet. The ADC subsystem stays uninitialized until it
  * lands; temperature reads as unavailable until then. v2 has no other ADC
@@ -250,6 +254,30 @@ static void init_i2c_bus(void)
     ESP_LOGI(TAG, "I2C bus: SDA=GPIO%d, SCL=GPIO%d", I2C_PIN_SDA, I2C_PIN_SCL);
 }
 
+/* Probe the whole 7-bit address space and log what ACKs. Run once at
+ * boot, before INA226 bring-up, so a dead/miswired bus is obvious and we
+ * can tell "nothing responds" (power/wiring/pull-ups) from "responds at
+ * unexpected addresses" (jumper error). Recommended by the v2 spec's
+ * "scan before trusting data" note. */
+static void i2c_bus_scan(void)
+{
+    int found = 0;
+    ESP_LOGI(TAG, "I2C scan (expecting 0x40/0x41/0x44/0x45):");
+    for (uint8_t addr = 0x08; addr <= 0x77; addr++) {
+        if (i2c_master_probe(s_i2c_bus, addr, 50) == ESP_OK) {
+            ESP_LOGI(TAG, "  found device @ 0x%02X", addr);
+            found++;
+        }
+    }
+    if (found == 0) {
+        ESP_LOGW(TAG, "  no I2C devices responded - check INA226 power (VS pin), "
+                      "SDA/SCL wiring on GPIO%d/%d, and bus pull-ups",
+                 I2C_PIN_SDA, I2C_PIN_SCL);
+    } else {
+        ESP_LOGI(TAG, "  %d device(s) responded", found);
+    }
+}
+
 static esp_err_t init_one_ina226(uint8_t addr, float shunt, float imax,
                                  ina226_handle_t *out)
 {
@@ -259,6 +287,7 @@ static esp_err_t init_one_ina226(uint8_t addr, float shunt, float imax,
     cfg.shunt_ohms    = shunt;
     cfg.max_current_a = imax;             /* with the v2 shunts, CAL -> 2048 */
     cfg.config_value  = INA226_CONFIG_STEADY;
+    cfg.scl_speed_hz  = INA226_SCL_HZ;
     cfg.voltage_trim  = 1.0f;
     cfg.current_trim  = 1.0f;
     return ina226_create(&cfg, out);
@@ -695,6 +724,7 @@ void app_main(void)
     }
 
     init_i2c_bus();
+    i2c_bus_scan();
 
     int ina_ok = init_ina226_all();
     if (ina_ok != 4) {
