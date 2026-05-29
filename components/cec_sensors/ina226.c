@@ -82,8 +82,10 @@ esp_err_t ina226_create(const ina226_config_t *config, ina226_handle_t *out_hand
                         ESP_ERR_INVALID_ARG, TAG, "max_current_a must be positive");
     ESP_RETURN_ON_FALSE(config->voltage_trim > 0.0f,
                         ESP_ERR_INVALID_ARG, TAG, "voltage_trim must be positive");
-    ESP_RETURN_ON_FALSE(config->current_trim > 0.0f,
-                        ESP_ERR_INVALID_ARG, TAG, "current_trim must be positive");
+    /* current_trim may be negative to invert the shunt sign on boards
+     * where IN+/IN- are wired backwards; only zero is invalid. */
+    ESP_RETURN_ON_FALSE(config->current_trim != 0.0f,
+                        ESP_ERR_INVALID_ARG, TAG, "current_trim must be nonzero");
 
     /* Allocate internal struct */
     struct ina226_dev_t *dev = calloc(1, sizeof(struct ina226_dev_t));

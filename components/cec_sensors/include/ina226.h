@@ -42,7 +42,8 @@ typedef struct {
     uint16_t config_value;                /* Config-register value written at create (0x00) */
     uint32_t scl_speed_hz;                /* Per-device SCL speed (typically 400000) */
     float voltage_trim;                   /* Multiplier applied to bus voltage (1.0 = raw) */
-    float current_trim;                   /* Multiplier applied to current (1.0 = raw) */
+    float current_trim;                   /* Multiplier applied to current (1.0 = raw,
+                                             -1.0 inverts sign for backwards-wired shunts) */
 } ina226_config_t;
 
 /* Default configuration block. Caller overrides fields they want changed. */

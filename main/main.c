@@ -59,8 +59,10 @@ static const char *TAG = "cec_main";
  *
  *   addr  rail    R_shunt   full-scale   (CAL computes to 2048 for all)
  *   0x40  +12V    0.002 R   40.96 A
- *   0x41  +5V     0.010 R    8.19 A
- *   0x44  +3.3V   0.025 R    3.28 A
+ *   0x41  +3.3V   0.025 R    3.28 A      (was 5V in the v2 spec; address
+ *                                         swapped here to match how this
+ *                                         board was physically jumpered)
+ *   0x44  +5V     0.010 R    8.19 A      (was 3.3V in the v2 spec; swap)
  *   0x45  +5VSB   0.025 R    3.28 A      (moved from 0x40 in v1)
  *
  * Current is read in software (shunt uV / R_shunt) so the non-standard
@@ -68,8 +70,8 @@ static const char *TAG = "cec_main";
  * (1.25 mV LSB) at the PSU side of each Kelvin shunt. Trims start at 1.0;
  * adjust per-rail against a meter if bench calibration shows drift. */
 #define INA226_ADDR_12V      0x40
-#define INA226_ADDR_5V       0x41
-#define INA226_ADDR_3V3      0x44
+#define INA226_ADDR_3V3      0x41   /* board-specific: 3.3V module is at 0x41 */
+#define INA226_ADDR_5V       0x44   /* board-specific: 5V module is at 0x44 */
 #define INA226_ADDR_5VSB     0x45
 
 #define INA226_SHUNT_12V     0.002f
@@ -279,7 +281,7 @@ static void i2c_bus_scan(void)
 }
 
 static esp_err_t init_one_ina226(uint8_t addr, float shunt, float imax,
-                                 ina226_handle_t *out)
+                                 float current_trim, ina226_handle_t *out)
 {
     ina226_config_t cfg = INA226_CONFIG_DEFAULT();
     cfg.bus_handle    = s_i2c_bus;
@@ -289,9 +291,19 @@ static esp_err_t init_one_ina226(uint8_t addr, float shunt, float imax,
     cfg.config_value  = INA226_CONFIG_STEADY;
     cfg.scl_speed_hz  = INA226_SCL_HZ;
     cfg.voltage_trim  = 1.0f;
-    cfg.current_trim  = 1.0f;
+    cfg.current_trim  = current_trim;
     return ina226_create(&cfg, out);
 }
+
+/* All four shunt terminals on this board are wired backwards relative to
+ * the INA226 IN+/IN- convention, so every rail gets current_trim = -1.0
+ * to flip the sign at the driver - the inversion is invisible to every
+ * downstream consumer (EMA, layers, swings, p_total, burst capture). On a
+ * future board where a rail is wired correctly, set its row back to +1.0. */
+#define INA226_ITRIM_12V    (-1.0f)
+#define INA226_ITRIM_5V     (-1.0f)
+#define INA226_ITRIM_3V3    (-1.0f)
+#define INA226_ITRIM_5VSB   (-1.0f)
 
 /* Bring up all four INA226 monitors. Returns the count that enumerated
  * so the caller can warn on a partial bus. A missing address is almost
@@ -299,18 +311,20 @@ static esp_err_t init_one_ina226(uint8_t addr, float shunt, float imax,
 static int init_ina226_all(void)
 {
     int ok = 0;
-    struct { uint8_t addr; float shunt; float imax; ina226_handle_t *out; const char *name; } rails[] = {
-        { INA226_ADDR_12V,  INA226_SHUNT_12V,  INA226_IMAX_12V,  &s_ina226_12v,  "12V"  },
-        { INA226_ADDR_5V,   INA226_SHUNT_5V,   INA226_IMAX_5V,   &s_ina226_5v,   "5V"   },
-        { INA226_ADDR_3V3,  INA226_SHUNT_3V3,  INA226_IMAX_3V3,  &s_ina226_3v3,  "3V3"  },
-        { INA226_ADDR_5VSB, INA226_SHUNT_5VSB, INA226_IMAX_5VSB, &s_ina226_5vsb, "5VSB" },
+    struct { uint8_t addr; float shunt; float imax; float itrim;
+             ina226_handle_t *out; const char *name; } rails[] = {
+        { INA226_ADDR_12V,  INA226_SHUNT_12V,  INA226_IMAX_12V,  INA226_ITRIM_12V,  &s_ina226_12v,  "12V"  },
+        { INA226_ADDR_5V,   INA226_SHUNT_5V,   INA226_IMAX_5V,   INA226_ITRIM_5V,   &s_ina226_5v,   "5V"   },
+        { INA226_ADDR_3V3,  INA226_SHUNT_3V3,  INA226_IMAX_3V3,  INA226_ITRIM_3V3,  &s_ina226_3v3,  "3V3"  },
+        { INA226_ADDR_5VSB, INA226_SHUNT_5VSB, INA226_IMAX_5VSB, INA226_ITRIM_5VSB, &s_ina226_5vsb, "5VSB" },
     };
     for (size_t i = 0; i < sizeof(rails) / sizeof(rails[0]); i++) {
         esp_err_t err = init_one_ina226(rails[i].addr, rails[i].shunt,
-                                        rails[i].imax, rails[i].out);
+                                        rails[i].imax, rails[i].itrim,
+                                        rails[i].out);
         if (err == ESP_OK) {
-            ESP_LOGI(TAG, "INA226 %s @ 0x%02X ready (R_shunt=%.3f)",
-                     rails[i].name, rails[i].addr, rails[i].shunt);
+            ESP_LOGI(TAG, "INA226 %s @ 0x%02X ready (R_shunt=%.3f, itrim=%+.1f)",
+                     rails[i].name, rails[i].addr, rails[i].shunt, rails[i].itrim);
             ok++;
         } else {
             ESP_LOGE(TAG, "INA226 %s @ 0x%02X init failed: %s",
