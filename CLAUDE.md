@@ -126,16 +126,20 @@ FOLLOWUPS.
   two), 5VSB EMA re-prime on `OFF→STANDBY` (kills the spurious Layer 1
   CRITICAL at PSU-plug-in), and a `capturing`/`dumping` phase split that
   recovers ~5 s of monitoring coverage per burst.
-- Open hardware issue: the 0x41 INA226 NACKs intermittently under load —
-  almost certainly the v2 spec §6 parallel-pull-up problem. User is
-  reworking the joints / pull-ups. Firmware escape hatch: drop
-  `INA226_SCL_HZ` from 400 000 to 100 000 in `main.c`.
-- Next once a PSU is connected and 0x41 is reliable: validate live V/I per
-  rail (currents should read positive under load after the sign flip),
-  confirm a burst dumps clean, verify the new phase split actually keeps
-  the slow loop alive through a dump.
-- Deferred: shutdown-detect debounce (analyzer C5); daughterboard NTC + CAN;
-  lint items L2/L3/L4/L6; 1 MHz HS voltage. All in `FOLLOWUPS.md`.
+- 0x41 bus reliability (was the open hardware issue): **fixed** by the
+  user's pull-up/joint rework — validation run shows 100% reads across
+  OFF/STANDBY/IDLE. Not yet stress-tested into ACTIVE/PEAK. The 100 kHz
+  `INA226_SCL_HZ` escape hatch was unneeded; left in place.
+- Two validation runs done (`teleplot_*` captures on PR #8): per-rail HS
+  carry-forward, 5VSB re-prime, phase split, and current-sign inversion
+  all confirmed; a real 12V collapse was captured end-to-end by a
+  shutdown burst. Latest fix on the branch: shutdown mute no longer
+  sticks in STANDBY (arm only from running states + level-based clear).
+- Next, when a PSU run goes into ACTIVE/PEAK: fully close out 0x41 under
+  heavy load; otherwise the firmware side is validated.
+- Deferred: shutdown-detect *premature-trip* debounce (analyzer C5, distinct
+  from the mute-stick fix); daughterboard NTC + CAN; lint items L2/L3/L4/L6;
+  1 MHz HS voltage; F1 streamer (designed). All in `FOLLOWUPS.md` / `design/`.
 - **F1 designed, not built** — continuous 1 kHz INA226 streamer for
   pre-trigger HS data. Implementation spec in
   [`design/F1_continuous_hs.md`](design/F1_continuous_hs.md); deferred

@@ -873,7 +873,18 @@ void app_main(void)
          * fast. Fire the burst and assert the mute. The capture path
          * has SHUTDOWN-bypasses-cooldown built in, so this always
          * captures even if a previous burst was recent. */
-        if (rate_valid && !s_shutting_down
+        /* Arm shutdown detection only from a running state (IDLE/ACTIVE/
+         * PEAK). You can't "begin shutting down" from a rail that's
+         * already at/near zero — without this guard, 12V decaying through
+         * the 5..10.5 V band while already in STANDBY re-asserts
+         * s_shutting_down every iteration, and since the mute-clear is a
+         * state-transition edge it never fires (no new edge), leaving the
+         * mute stuck for the whole STANDBY dwell. Gating arming on a
+         * running state kills that re-assert at the source. */
+        bool shutdown_armable = (s_state == CEC_STATE_IDLE
+                                 || s_state == CEC_STATE_ACTIVE
+                                 || s_state == CEC_STATE_PEAK);
+        if (rate_valid && !s_shutting_down && shutdown_armable
             && v_12v_ema > V_12V_SHUTDOWN_MIN_ARMED_V
             && v_12v_rate < V_12V_SHUTDOWN_RATE_THRESHOLD) {
             s_shutting_down = true;
@@ -885,13 +896,18 @@ void app_main(void)
                 ESP_LOGW(TAG, "burst trigger: SHUTDOWN");
             }
         }
-        /* Auto-clear the mute on timeout (e.g. brown-out that recovered
-         * without ever transitioning through STANDBY/OFF). The state-
-         * change clear is handled in the transition block below. */
-        if (s_shutting_down
-            && (esp_timer_get_time() - s_shutdown_start_us) > SHUTDOWN_MUTE_DURATION_US) {
-            s_shutting_down = false;
-            ESP_LOGI(TAG, "shutdown mute window expired");
+        /* Clear the mute on either (a) timeout, or (b) the system having
+         * settled into STANDBY/OFF — checked as a level, not just the
+         * transition edge, so a re-assert mid-STANDBY can't leave it
+         * stuck. Reaching STANDBY/OFF means the shutdown resolved. */
+        if (s_shutting_down) {
+            bool timed_out = (esp_timer_get_time() - s_shutdown_start_us) > SHUTDOWN_MUTE_DURATION_US;
+            bool rails_down = (s_state == CEC_STATE_STANDBY || s_state == CEC_STATE_OFF);
+            if (timed_out || rails_down) {
+                s_shutting_down = false;
+                ESP_LOGI(TAG, "shutdown mute cleared (%s)",
+                         timed_out ? "timeout" : "reached STANDBY/OFF");
+            }
         }
 
         cec_state_t next_state = cec_state_classify(v_12v_ema, v_5vsb_ema, p_total, s_state);
@@ -927,16 +943,10 @@ void app_main(void)
                 cec_layer1_reset(&s_l1_5vsb);
                 s_last_sev_5vsb = CEC_SEV_NONE;
             }
-            /* Landing in OFF or STANDBY means the shutdown sequence
-             * resolved (PSU unplugged → OFF, switched off → STANDBY).
-             * Clear the mute so detectors arm again as soon as the
-             * settle window passes. */
-            if (s_shutting_down
-                && (next_state == CEC_STATE_OFF || next_state == CEC_STATE_STANDBY)) {
-                s_shutting_down = false;
-                ESP_LOGI(TAG, "shutdown mute cleared by transition to %s",
-                         cec_state_name(next_state));
-            }
+            /* (Shutdown-mute clear is handled by the level check above,
+             * which fires whenever s_state is STANDBY/OFF — not just on
+             * this transition edge — so a re-assert mid-STANDBY can't
+             * leave it stuck.) */
             s_state = next_state;
             s_state_entered_us = now_us;
         }
