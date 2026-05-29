@@ -71,10 +71,13 @@ Tracking the port progress from Arduino-ESP32 v0.5.9 to ESP-IDF:
 | Layer 3 (Z-score anomaly) | Done |
 | Power-swing detector | Done |
 | Current-swing detector | Done |
-| Burst capture engine | Done (non-blocking, oneshot ADC; DMA path pending) |
+| Burst capture engine | Done (non-blocking; HS reads the continuous-mode cache) |
 | NVS profile storage | Done |
 | Serial command interface | Done (burst / set / status; ACS712 cal deferred — moving to INA226s) |
 | Shutdown detection + mute window | Done |
+
+Deferred work — EPS-parity items, a code-review cleanup (lint) list, and the
+hardware-driven INA226 swap — is tracked in [FOLLOWUPS.md](FOLLOWUPS.md).
 
 ## Behavior parity check
 
