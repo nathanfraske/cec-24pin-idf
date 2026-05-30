@@ -32,6 +32,8 @@ fragility issues.
 | C5 | tuning (deferred) | `main.c` shutdown detection | Premature shutdown trip at peak load (~19 s early): a single-second window with rate < −0.5 V/s isn't enough to discriminate load-step droop from real collapse. Proposed fix when actioned: require both rate AND `v_12v_ema < 11.5 V` floor. User wants to wait until other items settle. |
 | C6 | ✅ fixed (shutdown-arm PR) | `main.c` shutdown detection | Shutdown mute stuck ~24 s in STANDBY (validation run). The mute-clear fired only on the transition *edge* into STANDBY/OFF, but 12V decaying through the 5–10.5 V band re-asserted `s_shutting_down` while already in STANDBY, with no new edge to clear it. Fixed two ways: shutdown is now armed only from a running state (IDLE/ACTIVE/PEAK), killing the re-assert at the source; and the mute-clear is now a level check (`s_state ∈ {STANDBY,OFF}`) rather than an edge, so it can't get stuck. Distinct from C5 (premature *trip*); this was premature *un-clear*. |
 | C7 | ✅ resolved (saturation PR + re-shunt) | `main.c` rail config + main loop | **5V/0x41 shunt undersized for the rail.** The test PC pulls ~20 A on 5V, but the v2 sensor block put a 0.010 Ω shunt there: 8.19 A measurement range (so 20 A pinned the reading at full scale, dead flat even in HS, while `v_5v` read fine via the separate VBUS pin) and ~4 W of I²R that cooked the shunt/module. Bench diagnosis first chased a bad `V+→IN+` jumper joint and over-called a dead die; root cause was the undersized shunt (the earlier "5V on a 25 mΩ module" was the same fault at 10 W). **Fixed:** re-shunted to 0.002 Ω (R002) + new module → 40.96 A range, 0.8 W at 20 A; firmware `INA226_SHUNT_5V`/`INA226_IMAX_5V` → `0.002f`/`40.96f`. The episode also prompted a per-rail **saturation watchdog**: a rail pinned at ≥`SAT_PIN_FRACTION`·IMAX for ~1 s logs `SATURATION on <rail>` (over-current, beyond-range sensor, *or* railed/faulty chip), re-warns ~5 s, logs recovery on clear, fed only fresh reads (freezes on capture-skip/NACK). On the 40 A range the 5V rail now stays quiet under normal load. **Factory-spec feedback:** size the 5V production shunt for the real max 5V draw (range *and* dissipation), not the v2 default. **Optional follow-up:** latch a persistent "rail N sense fault — replace module" flag into `status` so it survives the scrolling log. |
+| C8 | deferred (deep-dive) | `cec_layer3.c` z-score | **Layer 3 zero-variance z-score blow-up.** The 2026-05-30 run (`teleplot_2026530_146.csv`) hit `z_max`=645 with no real event: the 5V Vbus sense was not jumpered yet, so `v_5v` read dead-flat ~0.064 V and that quantity's σ estimate collapsed, scoring tiny deviations as hundreds of σ → spurious `CEC_TRIG_ANOMALY` bursts. The existing `MIN_STD_FOR_Z` guard doesn't prevent it (hard cutoff leaves a danger band just above the floor; the constant is sub-LSB and shared across V/I). Self-resolves once the sense is jumpered; latent for any flatlined/stuck sensor. Full writeup + candidate fixes: see **Detection-layer hardening** below. |
+| C9 | deferred (deep-dive) | `main.c` slow-loop reads + `cec_layer3.c` | **Single-sample read glitch fires fake "all-rail dip" anomaly.** From `teleplot_2026530_1537.csv` (firmware `102d33f`): ~2 slow samples where 12V/5V/3V3 *all* read near-zero on both V and I simultaneously while 5VSB (0x45) stayed nominal; system ran 209 s more at full nominal voltages immediately after. Provably a sensor artifact (a real PSU collapse can't have V *and* I both go to zero, and the system survived). The bad reads bypassed any plausibility check, fed straight into the EMAs, and drove Layer 3 z-score 5.9→120 in one sample → spurious `CEC_TRIG_ANOMALY` (burst #29). Affects only the three rails that get mode-switched for HS bursts; lands ~9.9 s post-prior-teardown (near the 10 s cooldown boundary), hinting at a steady↔HS re-arm disturbance. 1 of 36 burst-adjacent windows. Pairs with C8 under **Detection-layer hardening** below. |
 
 ## EPS-parity deferrals
 
@@ -57,6 +59,133 @@ The shared daughterboard isn't built for this module yet. When the pigtail lands
   the full 1 kHz alongside current. Gated on the §6 pull-up fix (lift 3 of the
   4 module pull-ups) holding up at speed — check for garbage on the inputs
   before trusting it. Today HS voltage is decimated to ~100 Hz at 400 kHz.
+
+## Detection-layer hardening (deep-dive queued)
+
+False-positive sources in the detection stack, parked for a focused pass.
+None is a missed-fault risk — they manufacture spurious anomaly bursts and
+misleading transients, not blind spots.
+
+### Layer 3 — zero-variance z-score blow-up
+
+**Symptom.** Run `teleplot_2026530_146.csv` (firmware `102d33f`) hit
+`z_max` = 645 with no real event. The 5V Vbus sense was not jumpered yet
+(interim hardware), so `v_5v` read a dead-flat ~0.064 V for the whole run.
+Layer 3's profile for that quantity collapsed to ~zero spread, and small
+deviations then scored as hundreds of σ, firing spurious
+`CEC_TRIG_ANOMALY` bursts.
+
+**Mechanism** (`cec_detection/cec_layer3.c`). `std_dev` is an EMA of
+`|x − mean|` (a mean-absolute-deviation proxy for σ), adapted at
+`PROFILE_ADAPT_RATE` (0.0005) once warm. On a flat input, once `mean`
+converges, `|delta|` → ~0, so `std_dev` decays toward zero; `z_score()`
+returns `(x − mean) / std_dev`, which blows up as the denominator shrinks.
+
+**Why the existing guard misses it.** `MIN_STD_FOR_Z = 0.001f` only zeroes
+the z-score when `std_dev` is *below* the floor. But on a flat rail the std
+doesn't sit at zero — it's seeded at `INITIAL_STD_GUESS` (0.01) and decays
+*through* the band (0.001 … 0.01) as `|delta|` → 0, and it re-enters that
+band every time a per-state profile (OFF/STANDBY/IDLE/…) re-warms on the
+flat rail. Throughout that band the guard passes but the denominator is
+tiny, so any deviation (a transient read, or the rail not being perfectly
+constant) scores in the hundreds. The hard cutoff creates a *danger band
+just above the floor* instead of bounding the ratio. Compounding it: the
+floor is a single absolute constant — 0.001 is below one bus LSB
+(1.25 mV), and it's shared across voltage and current quantities whose
+scales differ (the current LSB now depends on the per-rail shunt: 1.25 mA
+on the 2 mΩ 5V shunt).
+
+**Impact.** Spurious bursts → wasted captures, UART dump traffic, brief
+capture-phase blackouts. Bounded by the 10 s burst cooldown (noise, not a
+tight loop). Self-resolves once the 5V sense is jumpered (real rail → real
+noise → healthy std), so this is *latent*, not a PR blocker — but any
+genuinely flatlined/stuck sensor, or a legitimately ultra-stable quantity,
+reproduces it.
+
+**Candidate fixes (decide in the dive).**
+- **A. Clamp, don't cut.** `z = (x − mean) / max(std_dev, floor)` bounds
+  amplification at `Δ/floor` instead of opening a danger band.
+- **B. Per-quantity (ideally per-rail) floors.** Separate V and I floors,
+  the current floor scaled to the rail's shunt LSB / expected noise —
+  passed into the profile or stored on it.
+- **C. Gate L3 on rail-present.** Skip z-scoring a voltage rail reading
+  below the rail-off floor (0.1 V); kills both the unjumpered-sense case
+  and genuine collapse (Layer 1 owns those). Doesn't cover a sensor stuck
+  at a *nominal* constant.
+- **D. Minimum-variance warm gate.** Don't mark a profile usable until it
+  has seen some spread. Risk: blinds L3 to slow excursions on quiet rails.
+
+**Lean:** **C + A together** — C removes the off/unsensed-rail case
+cleanly; A bounds the worst case for any other flat quantity; pick floors
+per-quantity.
+
+### Layer 3 — benign load-step anomalies (related)
+
+From the `teleplot_2026529_1327.csv` analysis: a normal IDLE→ACTIVE load
+ramp scored `z_max` = 8.09 (i_5v 2.7 → 3.6 A) and would fire
+`CEC_TRIG_ANOMALY` on any significant load step (swallowed there only by a
+burst cooldown). Different mechanism from the blow-up above (real step,
+healthy variance) but the same layer — worth deciding together whether
+routine load ramps should count as anomalies (profile warm-up, threshold,
+or an explicit rate/step guard).
+
+### Single-sample read glitch → fake "all-rail dip" anomaly (C9)
+
+**Symptom.** Run `teleplot_2026530_1537.csv` (firmware `102d33f`):
+**12V/5V/3V3** simultaneously dropped to **7.90 / 1.77 / 1.25 V** for ~2
+slow samples (~100 ms) at t ≈ 4186.7 s, while **5VSB (0x45) stayed flat at
+5.05 V**, then snapped back to 12.11/5.01/3.21 V. System ran another
+209 s at nominal. Frequency: 1 of 36 burst-adjacent windows in the run.
+
+**Why it's provably a sensor artifact, not a PSU event.**
+- **5VSB unaffected** — the only rail whose INA226 is never mode-switched.
+  The dip is isolated to *exactly* the three reconfigurable devices.
+- **Both V and I collapsed together** (12V: 1.11 A → 0.06 A). A real sag
+  is *caused by* a current change; both going to ~0 means the sensor
+  returned ~0 on both registers.
+- The PC kept running 209 s. At 5V = 1.77 V it'd have died instantly.
+
+**Mechanism (open).** The two bad reads were normal 10 Hz slow-loop rows
+(`cec_capture_is_capturing()` was false), reached the EMAs unfiltered,
+and drove the Layer 3 z-score 5.9 → 23.8 → 120 in one sample, crossing
+the 4.0 threshold → `CEC_TRIG_ANOMALY` (burst #29). The glitch landed
+~9.9 s after the prior burst teardown, near the 10 s cooldown boundary —
+suggests a steady↔HS mode-switch / re-arm disturbance on the three
+reconfigured INA226s, but I can't prove the internal mechanism from
+telemetry alone. Needs an on-bench repro with shunt µV / config-register
+inspection across teardown.
+
+**Two-layer impact.** This finding has two distinct fixes that should be
+considered separately:
+
+1. **Sensor-layer plausibility gate** (`main.c` main loop). A single
+   sample where a rail is classified up but its bus voltage reads
+   implausibly low, *or* where V and I both collapse to ~0 together,
+   should be discarded (hold last-good EMA) the way the HS per-rail
+   carry-forward already discards NACKs. Stops one bad read from reaching
+   any downstream layer.
+
+2. **Layer-3 spike immunity** (`cec_layer3.c`). The fact that **one
+   sample** can drive z from 5.9 → 120 is independently fragile. Same
+   "single sample shouldn't be able to fire a burst" theme as C8 — pairs
+   naturally with the C8 deep-dive. Options: a median/Hampel pre-filter
+   ahead of the z-score, a per-sample delta clamp, or requiring N
+   consecutive over-threshold samples (matches the rest of the stack's
+   consecutive-N pattern). The consecutive-N route also incidentally
+   closes the benign load-step issue above.
+
+3. **Root-cause the mode-switch glitch.** Whatever's producing the
+   near-zero pair on the three reconfigurable INA226s ~9.9 s after a
+   burst teardown deserves a focused look at the steady↔HS sequence in
+   `cec_capture.c` (timing, settle window, config-register write order,
+   whether the cooldown re-arm path can race the main-loop reads).
+   Plausibility gate + spike immunity treat the symptom; this is the
+   actual cure.
+
+**Lean:** plausibility gate is the cheapest, most defensive win
+(self-contained, no detector-tuning risk) and is worth a dedicated PR
+even before the deep-dive. Spike-immunity belongs in the C8 dive. The
+mode-switch investigation is its own piece of work.
 
 ## Future architectural ideas (not committed — write-ups for later decisions)
 

@@ -159,8 +159,12 @@ FOLLOWUPS.
 - Next, when a PSU run goes into ACTIVE/PEAK: fully close out 0x41 under
   heavy load; otherwise the firmware side is validated.
 - Deferred: shutdown-detect *premature-trip* debounce (analyzer C5, distinct
-  from the mute-stick fix); daughterboard NTC + CAN; lint items L2/L3/L4/L6;
-  1 MHz HS voltage; F1 streamer (designed). All in `FOLLOWUPS.md` / `design/`.
+  from the mute-stick fix); Layer-3 zero-variance z-score hardening (analyzer
+  C8 — spurious anomaly bursts on a flatlined rail); single-sample read-glitch
+  plausibility gate + L3 spike immunity (analyzer C9 — fake "all-rail dip"
+  anomaly from a transient sensor read); daughterboard NTC + CAN; lint items
+  L2/L3/L4/L6; 1 MHz HS voltage; F1 streamer (designed). All in
+  `FOLLOWUPS.md` / `design/`.
 - **F1 designed, not built** — continuous 1 kHz INA226 streamer for
   pre-trigger HS data. Implementation spec in
   [`design/F1_continuous_hs.md`](design/F1_continuous_hs.md); deferred
