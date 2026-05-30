@@ -59,7 +59,10 @@ static const char *TAG = "cec_main";
  *
  *   addr  rail    R_shunt   full-scale   (CAL computes to 2048 for all)
  *   0x40  +12V    0.002 R   40.96 A
- *   0x41  +5V     0.010 R    8.19 A
+ *   0x41  +5V     0.002 R   40.96 A      (re-shunted from 0.010 R; the 5V
+ *                                         rail on this PC pulls ~20 A, which
+ *                                         saturated the 8.19 A range and ran
+ *                                         4 W through the old 10 mO shunt)
  *   0x44  +3.3V   0.025 R    3.28 A
  *   0x45  +5VSB   0.025 R    3.28 A      (moved from 0x40 in v1)
  *
@@ -73,12 +76,12 @@ static const char *TAG = "cec_main";
 #define INA226_ADDR_5VSB     0x45
 
 #define INA226_SHUNT_12V     0.002f
-#define INA226_SHUNT_5V      0.010f
+#define INA226_SHUNT_5V      0.002f
 #define INA226_SHUNT_3V3     0.025f
 #define INA226_SHUNT_5VSB    0.025f
 
 #define INA226_IMAX_12V      40.96f
-#define INA226_IMAX_5V        8.19f
+#define INA226_IMAX_5V       40.96f
 #define INA226_IMAX_3V3       3.28f
 #define INA226_IMAX_5VSB      3.28f
 

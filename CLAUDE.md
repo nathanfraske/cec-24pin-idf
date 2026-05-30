@@ -46,7 +46,7 @@ detection layers → burst triggers, with TelePlot at 10 Hz and an INFO log at
   ADC voltage-divider taps and ACS712 current sensors are gone.
 - **Address → rail map** (matches v2 spec; see `main.c`):
   - `0x40` → 12V (0.002 Ω)
-  - `0x41` → 5V (0.010 Ω)
+  - `0x41` → 5V (0.002 Ω, re-shunted from 0.010 Ω — see below)
   - `0x44` → 3.3V (0.025 Ω)
   - `0x45` → 5VSB (0.025 Ω)
 - **Every rail's current is sign-inverted** (`INA226_ITRIM_* = -1.0`) because
@@ -134,19 +134,28 @@ FOLLOWUPS.
   all confirmed; a real 12V collapse was captured end-to-end by a
   shutdown burst. Latest fix on the branch: shutdown mute no longer
   sticks in STANDBY (arm only from running states + level-based clear).
-- **5V/0x41 INA226 died on the bench** (after the 3V3↔5V cables were
-  swapped back to v2 spec): a bad `V+→IN+` shunt-jumper joint bridged to
-  ground, ran away thermally, and cooked the die — the tell was current
-  pinned at full scale (8.19 A) dead flat while `v_5v` still read ~4.8 V.
-  Diagnosis sequence: bus pin healthy + shunt pin saturated + flat-in-HS +
-  module hot ⇒ damaged chip (shunt is metal, positive tempco, can't run
-  away). Module awaits a replacement INA226 — **strap the new one to 0x41
-  (A0→VS, A1→GND)** or it enumerates at the default 0x40. Prompted a
-  **per-rail saturation watchdog** in `main.c`: any rail pinned at its IMAX
-  ceiling (`SAT_PIN_FRACTION`·IMAX) for ~1 s logs a loud `SATURATION on
-  <rail>` warning (sustained over-current *or* a railed/faulty sensor),
-  re-warns every ~5 s, and logs recovery on clear. Fed only fresh reads so
-  a capture-skip or NACK freezes the episode rather than skewing it.
+- **5V/0x41 INA226 — undersized shunt, now resolved.** The 5V rail on the
+  test PC pulls ~20 A, but the v2 sensor block put a 0.010 Ω shunt there
+  (8.19 A range, and 4 W of I²R at 20 A). That saturated the reading at
+  full scale (a "solid 8.19 A," dead flat even in HS, while `v_5v` read
+  fine because VBUS is a separate pin) and cooked the shunt/module. Initial
+  bench diagnosis chased a bad `V+→IN+` jumper joint and over-called a dead
+  die; the actual root cause was the undersized shunt (the original "5V on
+  a 25 mΩ module" oopsie was the same fault, worse: 10 W). **Fixed:**
+  re-shunted to **0.002 Ω (R002)** + replaced the module → 40.96 A range,
+  0.8 W at 20 A (mirrors the 12V rail). Firmware updated
+  (`INA226_SHUNT_5V` / `INA226_IMAX_5V` → `0.002f` / `40.96f`). On first
+  power-up: confirm the boot I²C scan still shows 0x41 (strap A0→VS,
+  A1→GND), and that `i_5v` reads positive under load — if the replacement
+  module's terminals are wired correctly rather than backwards like the
+  others, flip `INA226_ITRIM_5V` to `+1.0`.
+- The episode prompted a **per-rail saturation watchdog** in `main.c`: any
+  rail pinned at its IMAX ceiling (`SAT_PIN_FRACTION`·IMAX) for ~1 s logs a
+  loud `SATURATION on <rail>` warning (sustained over-current, a sensor
+  beyond its range, *or* a railed/faulty chip), re-warns every ~5 s, and
+  logs recovery on clear. Fed only fresh reads so a capture-skip or NACK
+  freezes the episode rather than skewing it. With the 5V rail now on a
+  40 A range it stays quiet under the normal ~20 A load.
 - Next, when a PSU run goes into ACTIVE/PEAK: fully close out 0x41 under
   heavy load; otherwise the firmware side is validated.
 - Deferred: shutdown-detect *premature-trip* debounce (analyzer C5, distinct
