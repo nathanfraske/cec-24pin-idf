@@ -1,14 +1,19 @@
 /*
- * CEC 24-pin Module Firmware - ESP-IDF port
+ * CEC 24-pin Module Firmware - ESP-IDF port (prototype v2 sensor block)
  *
- * Brings up the I2C bus + INA226 (5VSB), the ADC1 voltage-rail divider
- * reads (12V/5V/3V3), the ACS712 current sensors on the same three rails,
- * and the NTC thermistor, all matching the v0.5.9 hardware configuration.
- * Samples everything at 50 Hz, runs each channel through a fast EMA, and
- * emits TelePlot series at 10 Hz with a 1 Hz INFO summary line.
+ * Brings up the I2C bus and the four INA226 power monitors (12V @0x40,
+ * 5V @0x41, 3V3 @0x44, 5VSB @0x45), reading bus voltage and software-
+ * computed current (shunt uV / R_shunt) from each. Samples at 50 Hz,
+ * runs each channel through a fast EMA, feeds the state classifier and
+ * detection layers, and emits TelePlot series at 10 Hz with a 1 Hz INFO
+ * summary line.
  *
- * Compare against v0.5.9 captures on the same hardware. Numbers should
- * match within measurement noise once per-unit trim is dialed in.
+ * Burst capture reconfigures the 3 main-rail INA226s to fast mode and
+ * captures current at 1 kHz (voltage decimated to ~100 Hz) for the HS
+ * window.
+ *
+ * NTC temperature (ADC1_CH6) and CAN (TWAI, RX moved to GPIO15) arrive
+ * with the shared daughterboard and are not wired in this build.
  */
 
 #include <stdio.h>
@@ -28,9 +33,8 @@
 #include "driver/i2c_master.h"
 
 #include "ina226.h"
-#include "cec_adc.h"
-#include "thermistor.h"
-#include "acs712.h"
+/* cec_adc / thermistor remain in the cec_sensors component for the NTC
+ * channel that arrives with the daughterboard; not used yet in v2. */
 #include "cec_filters.h"
 #include "cec_state.h"
 #include "cec_layer1.h"
@@ -49,44 +53,47 @@ static const char *TAG = "cec_main";
 #define I2C_PIN_SCL       9
 #define I2C_PORT_NUM      I2C_NUM_0
 
-/* ADC1 channels (GPIO1..7 = ADC1_CH0..6), pin map from v0.5.9 */
-#define ADC_CH_V_12V      ADC_CHANNEL_0   /* GPIO1 */
-#define ADC_CH_V_5V       ADC_CHANNEL_1   /* GPIO2 */
-#define ADC_CH_V_3V3      ADC_CHANNEL_2   /* GPIO3 */
-#define ADC_CH_I_12V      ADC_CHANNEL_3   /* GPIO4 */
-#define ADC_CH_I_5V       ADC_CHANNEL_4   /* GPIO5 */
-#define ADC_CH_I_3V3      ADC_CHANNEL_5   /* GPIO6 */
-#define ADC_CH_NTC        ADC_CHANNEL_6   /* GPIO7 */
-
-/* Per-rail trim factors carried forward from v0.5.9 (hardware-specific) */
-#define TRIM_12V          1.0000f
-#define TRIM_5V           0.9962f
-#define TRIM_3V3          0.9915f
-#define TRIM_5VSB         0.9901f
-
-/* Hardware voltage dividers (top + bottom of resistor stack), v0.5.9 */
-#define SCALE_12V         ((47000.0f + 10000.0f) / 10000.0f)
-#define SCALE_5V          ((15000.0f + 10000.0f) / 10000.0f)
-#define SCALE_3V3         (( 4700.0f + 10000.0f) / 10000.0f)
-
-/* ACS712 divider (between sensor output and ADC pin) and per-part
- * sensitivities, from v0.5.9. The 30A part sits on the 12V rail; both
- * 20A parts sit on the 5V/3V3 rails. */
-#define ACS712_DIVIDER       ((20000.0f + 30000.0f) / 30000.0f)
-#define ACS712_30A_SENS      0.066f
-#define ACS712_20A_SENS      0.100f
-/* Per-rail no-load output (post-divider voltage). Nominal Vcc/2 = 2.20 V
- * but the part-to-part variation is several tens of mV (hundreds of mA
- * at these sensitivities), so each rail gets its own constant for hand-
- * tuning. The boot-time diagnostic logs the measured no-load output —
- * with the PSU disconnected at first boot, copy those values here. Full
- * runtime calibration lands with the serial-command + NVS path.
+/* v2 sensor block: four INA226 monitors share I2C0 (SDA 8 / SCL 9).
+ * Firmware keys off I2C address; physical slot is irrelevant (the modules
+ * were rearranged on the board). Address->rail->shunt is authoritative.
  *
- * Values below are the per-unit no-load measurements captured against
- * this board with the PSU disconnected. */
-#define ACS712_ZERO_12V      2.4483f
-#define ACS712_ZERO_5V       2.1967f
-#define ACS712_ZERO_3V3      2.2117f
+ *   addr  rail    R_shunt   full-scale   (CAL computes to 2048 for all)
+ *   0x40  +12V    0.002 R   40.96 A
+ *   0x41  +5V     0.002 R   40.96 A      (re-shunted from 0.010 R; the 5V
+ *                                         rail on this PC pulls ~20 A, which
+ *                                         saturated the 8.19 A range and ran
+ *                                         4 W through the old 10 mO shunt)
+ *   0x44  +3.3V   0.025 R    3.28 A
+ *   0x45  +5VSB   0.025 R    3.28 A      (moved from 0x40 in v1)
+ *
+ * Current is read in software (shunt uV / R_shunt) so the non-standard
+ * shunts need no per-LSB bookkeeping. Voltage is the INA226 bus register
+ * (1.25 mV LSB) at the PSU side of each Kelvin shunt. Trims start at 1.0;
+ * adjust per-rail against a meter if bench calibration shows drift. */
+#define INA226_ADDR_12V      0x40
+#define INA226_ADDR_5V       0x41
+#define INA226_ADDR_3V3      0x44
+#define INA226_ADDR_5VSB     0x45
+
+#define INA226_SHUNT_12V     0.002f
+#define INA226_SHUNT_5V      0.002f
+#define INA226_SHUNT_3V3     0.025f
+#define INA226_SHUNT_5VSB    0.025f
+
+#define INA226_IMAX_12V      40.96f
+#define INA226_IMAX_5V       40.96f
+#define INA226_IMAX_3V3       3.28f
+#define INA226_IMAX_5VSB      3.28f
+
+/* Per-device I2C clock. 400 kHz per the v2 spec; drop to 100000 if the
+ * four parallel breakout pull-ups make the bus marginal (spec section 6). */
+#define INA226_SCL_HZ        400000
+
+/* NTC thermistor lives on ADC1_CH6 (GPIO7) on the shared daughterboard,
+ * which is not built yet. The ADC subsystem stays uninitialized until it
+ * lands; temperature reads as unavailable until then. v2 has no other ADC
+ * sensor - rail voltage now comes from the INA226 bus register, so the
+ * old resistor-divider taps are gone. */
 
 /* Loop cadence. Sample at 50 Hz to match v0.5.9; emit TelePlot at 10 Hz
  * (every 5th iteration); log an INFO summary at 1 Hz (every 50th). */
@@ -101,85 +108,13 @@ static const char *TAG = "cec_main";
 /* I2C bus handle (shared across components later) */
 static i2c_master_bus_handle_t s_i2c_bus = NULL;
 
-/* INA226 instances. For now only 5VSB. Will add 12V/5V/3V3 after PCB rev. */
+/* INA226 instances, one per rail. All four share the I2C0 bus. The 3
+ * main rails (12V/5V/3V3) are reconfigured to fast mode during an HS
+ * burst; 5VSB stays in steady mode. */
+static ina226_handle_t s_ina226_12v  = NULL;
+static ina226_handle_t s_ina226_5v   = NULL;
+static ina226_handle_t s_ina226_3v3  = NULL;
 static ina226_handle_t s_ina226_5vsb = NULL;
-
-/* ADC rail configs. At 50 Hz the per-iteration ADC time budget is tight,
- * so samples-per-read is dropped from 8 to 4 vs. the 5 Hz era. Calibration
- * curve-fitting handles the rest. */
-static const cec_adc_rail_t s_rail_12v = {
-    .channel = ADC_CH_V_12V, .samples = 4, .scale = SCALE_12V, .trim = TRIM_12V,
-};
-static const cec_adc_rail_t s_rail_5v = {
-    .channel = ADC_CH_V_5V,  .samples = 4, .scale = SCALE_5V,  .trim = TRIM_5V,
-};
-static const cec_adc_rail_t s_rail_3v3 = {
-    .channel = ADC_CH_V_3V3, .samples = 4, .scale = SCALE_3V3, .trim = TRIM_3V3,
-};
-
-/* NTC config carried forward from v0.5.9. Standard 10k @ 25C, B=3950. */
-static const thermistor_t s_ntc = {
-    .channel = ADC_CH_NTC,
-    .samples = 4,
-    .beta = 3950.0f,
-    .nominal_resistance = 10000.0f,
-    .nominal_temperature_k = 298.15f,
-    .pull_up_resistance = 10000.0f,
-    .vcc = 3.3f,
-};
-
-/* ACS712 sensor configs. zero_point_v is the no-load nominal until per-
- * unit calibration lands; expect currents to be a few hundred mA off
- * until that path is wired in. */
-static const acs712_t s_acs_12v = {
-    .channel = ADC_CH_I_12V, .samples = 4,
-    .divider_scale = ACS712_DIVIDER,
-    .sensitivity_v_per_a = ACS712_30A_SENS,
-    .zero_point_v = ACS712_ZERO_12V,
-};
-static const acs712_t s_acs_5v = {
-    .channel = ADC_CH_I_5V,  .samples = 4,
-    .divider_scale = ACS712_DIVIDER,
-    .sensitivity_v_per_a = ACS712_20A_SENS,
-    .zero_point_v = ACS712_ZERO_5V,
-};
-static const acs712_t s_acs_3v3 = {
-    .channel = ADC_CH_I_3V3, .samples = 4,
-    .divider_scale = ACS712_DIVIDER,
-    .sensitivity_v_per_a = ACS712_20A_SENS,
-    .zero_point_v = ACS712_ZERO_3V3,
-};
-
-/* HS-rate configs (samples=1) used by the burst capture engine to keep
- * each 1 kHz iteration well under the 1 ms budget. Scale/trim/zero match
- * the main-loop configs above. */
-static const cec_adc_rail_t s_hs_rail_12v = {
-    .channel = ADC_CH_V_12V, .samples = 1, .scale = SCALE_12V, .trim = TRIM_12V,
-};
-static const cec_adc_rail_t s_hs_rail_5v = {
-    .channel = ADC_CH_V_5V,  .samples = 1, .scale = SCALE_5V,  .trim = TRIM_5V,
-};
-static const cec_adc_rail_t s_hs_rail_3v3 = {
-    .channel = ADC_CH_V_3V3, .samples = 1, .scale = SCALE_3V3, .trim = TRIM_3V3,
-};
-static const acs712_t s_hs_acs_12v = {
-    .channel = ADC_CH_I_12V, .samples = 1,
-    .divider_scale = ACS712_DIVIDER,
-    .sensitivity_v_per_a = ACS712_30A_SENS,
-    .zero_point_v = ACS712_ZERO_12V,
-};
-static const acs712_t s_hs_acs_5v = {
-    .channel = ADC_CH_I_5V,  .samples = 1,
-    .divider_scale = ACS712_DIVIDER,
-    .sensitivity_v_per_a = ACS712_20A_SENS,
-    .zero_point_v = ACS712_ZERO_5V,
-};
-static const acs712_t s_hs_acs_3v3 = {
-    .channel = ADC_CH_I_3V3, .samples = 1,
-    .divider_scale = ACS712_DIVIDER,
-    .sensitivity_v_per_a = ACS712_20A_SENS,
-    .zero_point_v = ACS712_ZERO_3V3,
-};
 
 /* Filter state */
 static ema_t s_v_5vsb_ema, s_i_5vsb_ema;
@@ -259,6 +194,27 @@ static float s_i_swing_12v_buf[CURRENT_SWING_WINDOW_SIZE];
 static float s_i_swing_5v_buf [CURRENT_SWING_WINDOW_SIZE];
 static float s_i_swing_3v3_buf[CURRENT_SWING_WINDOW_SIZE];
 
+/* Per-rail saturation / stuck-current watchdog. The software current path
+ * (shunt_uV / R_shunt) physically caps at the INA226 shunt full scale
+ * (±81.92 mV → ±IMAX), so a railed front end — a floating IN+/IN-, a cooked
+ * die, or a genuine sustained over-current — pins the reading at IMAX and
+ * holds it dead flat. That masquerades as a real, healthy number (the
+ * "solid 8.19 A" that cost a prototype module its INA226), so watch for it
+ * explicitly: after ~1 s pinned, log a loud warning naming the rail;
+ * re-warn every ~5 s while it persists; log a one-line recovery when it
+ * clears. Fed only fresh reads (see the loop), so a transient NACK or a
+ * capture-skipped sample freezes an episode rather than advancing or
+ * resetting it. */
+#define SAT_PIN_FRACTION    0.99f   /* |i| >= 99% of IMAX counts as pinned */
+#define SAT_HOLD_SAMPLES    50u     /* ~1 s at 50 Hz before the first warning */
+#define SAT_REWARN_SAMPLES  250u    /* re-warn cadence (~5 s) while still pinned */
+typedef enum { SAT_EVT_NONE = 0, SAT_EVT_WARN, SAT_EVT_RECOVERED } sat_event_t;
+typedef struct {
+    uint32_t count;    /* consecutive pinned fresh samples */
+    bool     warned;   /* a warning has fired for the current episode */
+} sat_watch_t;
+static sat_watch_t s_sat_12v, s_sat_5v, s_sat_3v3, s_sat_5vsb;
+
 /* NVS persistence for Layer 3 profiles. The magic prefix lets a future
  * firmware revision reject an old blob cleanly if the layout changes. */
 #define NVS_PROFILES_KEY     "profiles"
@@ -322,34 +278,82 @@ static void init_i2c_bus(void)
     ESP_LOGI(TAG, "I2C bus: SDA=GPIO%d, SCL=GPIO%d", I2C_PIN_SDA, I2C_PIN_SCL);
 }
 
-static esp_err_t init_adc_rails(void)
+/* Probe the whole 7-bit address space and log what ACKs. Run once at
+ * boot, before INA226 bring-up, so a dead/miswired bus is obvious and we
+ * can tell "nothing responds" (power/wiring/pull-ups) from "responds at
+ * unexpected addresses" (jumper error). Recommended by the v2 spec's
+ * "scan before trusting data" note. */
+static void i2c_bus_scan(void)
 {
-    ESP_RETURN_ON_ERROR(cec_adc_init(), TAG, "cec_adc_init");
-    ESP_RETURN_ON_ERROR(cec_adc_setup_channel(ADC_CH_V_12V), TAG, "setup v_12V");
-    ESP_RETURN_ON_ERROR(cec_adc_setup_channel(ADC_CH_V_5V),  TAG, "setup v_5V");
-    ESP_RETURN_ON_ERROR(cec_adc_setup_channel(ADC_CH_V_3V3), TAG, "setup v_3V3");
-    ESP_RETURN_ON_ERROR(acs712_setup(&s_acs_12v),            TAG, "setup i_12V");
-    ESP_RETURN_ON_ERROR(acs712_setup(&s_acs_5v),             TAG, "setup i_5V");
-    ESP_RETURN_ON_ERROR(acs712_setup(&s_acs_3v3),            TAG, "setup i_3V3");
-    ESP_RETURN_ON_ERROR(thermistor_setup(&s_ntc),            TAG, "setup NTC");
-    /* Pattern locked once we hit start; from here on, channel reads
-     * come from the DMA-backed latest-mV table maintained by the
-     * cec_adc reader task. */
-    ESP_RETURN_ON_ERROR(cec_adc_start(),                     TAG, "cec_adc_start");
-    return ESP_OK;
+    int found = 0;
+    ESP_LOGI(TAG, "I2C scan (expecting 0x40/0x41/0x44/0x45):");
+    for (uint8_t addr = 0x08; addr <= 0x77; addr++) {
+        if (i2c_master_probe(s_i2c_bus, addr, 50) == ESP_OK) {
+            ESP_LOGI(TAG, "  found device @ 0x%02X", addr);
+            found++;
+        }
+    }
+    if (found == 0) {
+        ESP_LOGW(TAG, "  no I2C devices responded - check INA226 power (VS pin), "
+                      "SDA/SCL wiring on GPIO%d/%d, and bus pull-ups",
+                 I2C_PIN_SDA, I2C_PIN_SCL);
+    } else {
+        ESP_LOGI(TAG, "  %d device(s) responded", found);
+    }
 }
 
-static esp_err_t init_ina226_5vsb(void)
+static esp_err_t init_one_ina226(uint8_t addr, float shunt, float imax,
+                                 float current_trim, ina226_handle_t *out)
 {
     ina226_config_t cfg = INA226_CONFIG_DEFAULT();
-    cfg.bus_handle = s_i2c_bus;
-    cfg.i2c_addr = 0x40;          /* INA226 default A0=A1=GND */
-    cfg.shunt_ohms = 0.002f;      /* R002 marking on the physical module */
-    cfg.max_current_a = 5.0f;     /* Matches v0.5.9, gives CAL=0x418A */
-    cfg.voltage_trim = TRIM_5VSB; /* Match v0.5.9 calibration */
-    cfg.current_trim = 1.0f;      /* No current trim on 5VSB */
+    cfg.bus_handle    = s_i2c_bus;
+    cfg.i2c_addr      = addr;
+    cfg.shunt_ohms    = shunt;
+    cfg.max_current_a = imax;             /* with the v2 shunts, CAL -> 2048 */
+    cfg.config_value  = INA226_CONFIG_STEADY;
+    cfg.scl_speed_hz  = INA226_SCL_HZ;
+    cfg.voltage_trim  = 1.0f;
+    cfg.current_trim  = current_trim;
+    return ina226_create(&cfg, out);
+}
 
-    return ina226_create(&cfg, &s_ina226_5vsb);
+/* All four shunt terminals on this board are wired backwards relative to
+ * the INA226 IN+/IN- convention, so every rail gets current_trim = -1.0
+ * to flip the sign at the driver - the inversion is invisible to every
+ * downstream consumer (EMA, layers, swings, p_total, burst capture). On a
+ * future board where a rail is wired correctly, set its row back to +1.0. */
+#define INA226_ITRIM_12V    (-1.0f)
+#define INA226_ITRIM_5V     (-1.0f)
+#define INA226_ITRIM_3V3    (-1.0f)
+#define INA226_ITRIM_5VSB   (-1.0f)
+
+/* Bring up all four INA226 monitors. Returns the count that enumerated
+ * so the caller can warn on a partial bus. A missing address is almost
+ * always an address-jumper error on a module, not a firmware bug. */
+static int init_ina226_all(void)
+{
+    int ok = 0;
+    struct { uint8_t addr; float shunt; float imax; float itrim;
+             ina226_handle_t *out; const char *name; } rails[] = {
+        { INA226_ADDR_12V,  INA226_SHUNT_12V,  INA226_IMAX_12V,  INA226_ITRIM_12V,  &s_ina226_12v,  "12V"  },
+        { INA226_ADDR_5V,   INA226_SHUNT_5V,   INA226_IMAX_5V,   INA226_ITRIM_5V,   &s_ina226_5v,   "5V"   },
+        { INA226_ADDR_3V3,  INA226_SHUNT_3V3,  INA226_IMAX_3V3,  INA226_ITRIM_3V3,  &s_ina226_3v3,  "3V3"  },
+        { INA226_ADDR_5VSB, INA226_SHUNT_5VSB, INA226_IMAX_5VSB, INA226_ITRIM_5VSB, &s_ina226_5vsb, "5VSB" },
+    };
+    for (size_t i = 0; i < sizeof(rails) / sizeof(rails[0]); i++) {
+        esp_err_t err = init_one_ina226(rails[i].addr, rails[i].shunt,
+                                        rails[i].imax, rails[i].itrim,
+                                        rails[i].out);
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "INA226 %s @ 0x%02X ready (R_shunt=%.3f, itrim=%+.1f)",
+                     rails[i].name, rails[i].addr, rails[i].shunt, rails[i].itrim);
+            ok++;
+        } else {
+            ESP_LOGE(TAG, "INA226 %s @ 0x%02X init failed: %s",
+                     rails[i].name, rails[i].addr, esp_err_to_name(err));
+        }
+    }
+    return ok;
 }
 
 static void init_layer1(void)
@@ -529,52 +533,44 @@ static layer1_step_result_t layer1_step(const char *rail_name,
     };
 }
 
-/* Sample each ACS712's no-load output and log what it reads, along with
- * the equivalent offset current vs. the constants currently compiled in.
- * Run once at boot before the main loop starts feeding the sensors.
- * Lets you copy the measured no-load voltages directly into
- * ACS712_ZERO_{12V,5V,3V3} for a per-unit-tuned offset until the proper
- * serial-command / NVS calibration path lands. */
-static void log_acs712_zero_measurements(void)
+/* Burst capture hooks (run on the capture task, Core 1).
+ *
+ * setup: switch the 3 main-rail INA226s into fast shunt+bus continuous
+ *        mode (~280 us/pair, ~3.5 kHz) so the 1 kHz HS loop sees fresh
+ *        samples. 5VSB is left in steady mode (not part of HS).
+ * teardown: restore steady (16-avg) mode after the capture.
+ */
+static void hs_setup_fn(void)
 {
-    struct {
-        const char *name;
-        const acs712_t *cfg;
-        float compiled_zero;
-        float sens;
-    } rails[] = {
-        { "12V", &s_acs_12v, ACS712_ZERO_12V, ACS712_30A_SENS },
-        { "5V",  &s_acs_5v,  ACS712_ZERO_5V,  ACS712_20A_SENS },
-        { "3V3", &s_acs_3v3, ACS712_ZERO_3V3, ACS712_20A_SENS },
-    };
-    ESP_LOGI(TAG, "ACS712 no-load diagnostic (200-sample average):");
-    for (size_t i = 0; i < sizeof(rails) / sizeof(rails[0]); i++) {
-        float measured = 0.0f;
-        esp_err_t err = acs712_measure_zero_point(rails[i].cfg, 200, &measured);
-        if (err != ESP_OK) {
-            ESP_LOGW(TAG, "  %s: measure failed (%s)", rails[i].name, esp_err_to_name(err));
-            continue;
-        }
-        float implied_a = (measured - rails[i].compiled_zero) / rails[i].sens;
-        ESP_LOGI(TAG, "  %s: measured=%.4f V, compiled=%.4f V "
-                      "=> implied no-load current = %+.3f A",
-                 rails[i].name, measured, rails[i].compiled_zero, implied_a);
-    }
-    ESP_LOGI(TAG, "If \"implied no-load current\" is non-zero with PSU "
-                  "disconnected, paste the measured V into ACS712_ZERO_<rail>.");
+    if (s_ina226_12v) ina226_set_config(s_ina226_12v, INA226_CONFIG_HS);
+    if (s_ina226_5v)  ina226_set_config(s_ina226_5v,  INA226_CONFIG_HS);
+    if (s_ina226_3v3) ina226_set_config(s_ina226_3v3, INA226_CONFIG_HS);
 }
 
-/* Burst capture HS sample callback. Runs at 1 kHz on the cec_hs_cap task
- * (Core 1) — must stay well under 1 ms. Six oneshot ADC reads + scaling
- * comfortably fit. */
-static void hs_sample_fn(cec_capture_hs_sample_t *out)
+static void hs_teardown_fn(void)
 {
-    cec_adc_read(&s_hs_rail_12v, &out->v_12v);
-    cec_adc_read(&s_hs_rail_5v,  &out->v_5v);
-    cec_adc_read(&s_hs_rail_3v3, &out->v_3v3);
-    acs712_read_amps(&s_hs_acs_12v, &out->i_12v);
-    acs712_read_amps(&s_hs_acs_5v,  &out->i_5v);
-    acs712_read_amps(&s_hs_acs_3v3, &out->i_3v3);
+    if (s_ina226_12v) ina226_set_config(s_ina226_12v, INA226_CONFIG_STEADY);
+    if (s_ina226_5v)  ina226_set_config(s_ina226_5v,  INA226_CONFIG_STEADY);
+    if (s_ina226_3v3) ina226_set_config(s_ina226_3v3, INA226_CONFIG_STEADY);
+}
+
+/* HS sample callback at 1 kHz on the capture task. Current (shunt) on the
+ * 3 main rails every sample; bus voltage only when want_voltage (~100 Hz)
+ * so the I2C budget stays inside 1 ms at 400 kHz. Returns a per-rail
+ * success bitmask — the engine carries forward each unset bit separately
+ * so one device's NACK can't void healthy rails. */
+static uint32_t hs_sample_fn(cec_capture_hs_sample_t *out, bool want_voltage)
+{
+    uint32_t ok = 0;
+    if (ina226_read_current(s_ina226_12v, &out->i_12v) == ESP_OK) ok |= CEC_HS_OK_I_12V;
+    if (ina226_read_current(s_ina226_5v,  &out->i_5v)  == ESP_OK) ok |= CEC_HS_OK_I_5V;
+    if (ina226_read_current(s_ina226_3v3, &out->i_3v3) == ESP_OK) ok |= CEC_HS_OK_I_3V3;
+    if (want_voltage) {
+        if (ina226_read_bus_voltage(s_ina226_12v, &out->v_12v) == ESP_OK) ok |= CEC_HS_OK_V_12V;
+        if (ina226_read_bus_voltage(s_ina226_5v,  &out->v_5v)  == ESP_OK) ok |= CEC_HS_OK_V_5V;
+        if (ina226_read_bus_voltage(s_ina226_3v3, &out->v_3v3) == ESP_OK) ok |= CEC_HS_OK_V_3V3;
+    }
+    return ok;
 }
 
 /* ---------------------------- CLI handlers ---------------------------- */
@@ -725,6 +721,33 @@ static const cec_cli_command_t s_cli_commands[] = {
     { "status", "status [json] — current state, EMA readings, layer enables, profile warmth", cli_cmd_status },
 };
 
+/* Advance one rail's saturation watchdog with a fresh current sample.
+ * Returns SAT_EVT_WARN on the sample where a warning should fire (first at
+ * the hold threshold, then every SAT_REWARN_SAMPLES while still pinned),
+ * SAT_EVT_RECOVERED on the sample where a flagged episode ends, and
+ * SAT_EVT_NONE otherwise. Pure bookkeeping; the caller owns the logging so
+ * it can name the rail. */
+static sat_event_t sat_watch_update(sat_watch_t *w, float i_amps, float imax)
+{
+    if (fabsf(i_amps) >= SAT_PIN_FRACTION * imax) {
+        w->count++;
+        if (w->count == SAT_HOLD_SAMPLES ||
+            (w->count > SAT_HOLD_SAMPLES &&
+             (w->count - SAT_HOLD_SAMPLES) % SAT_REWARN_SAMPLES == 0)) {
+            w->warned = true;
+            return SAT_EVT_WARN;
+        }
+        return SAT_EVT_NONE;
+    }
+    if (w->warned) {            /* a flagged episode just ended */
+        w->count = 0;
+        w->warned = false;
+        return SAT_EVT_RECOVERED;
+    }
+    w->count = 0;
+    return SAT_EVT_NONE;
+}
+
 static void log_hardware_info(void)
 {
     esp_chip_info_t chip_info;
@@ -765,17 +788,12 @@ void app_main(void)
     }
 
     init_i2c_bus();
+    i2c_bus_scan();
 
-    esp_err_t err = init_ina226_5vsb();
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "INA226 5VSB init failed: %s", esp_err_to_name(err));
-        ESP_LOGW(TAG, "Continuing without INA226 readings");
-    }
-
-    err = init_adc_rails();
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "ADC rail init failed: %s", esp_err_to_name(err));
-        ESP_LOGW(TAG, "Continuing without ADC rail readings");
+    int ina_ok = init_ina226_all();
+    if (ina_ok != 4) {
+        ESP_LOGW(TAG, "only %d/4 INA226 enumerated - check address jumpers; "
+                      "missing rails will read unavailable", ina_ok);
     }
 
     ema_init(&s_v_5vsb_ema, EMA_ALPHA_FAST);
@@ -807,9 +825,12 @@ void app_main(void)
                  esp_err_to_name(cli_err));
     }
 
-    log_acs712_zero_measurements();
-
-    err = cec_capture_init(hs_sample_fn);
+    const cec_capture_config_t cap_cfg = {
+        .sample_fn   = hs_sample_fn,
+        .setup_fn    = hs_setup_fn,
+        .teardown_fn = hs_teardown_fn,
+    };
+    esp_err_t err = cec_capture_init(&cap_cfg);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "cec_capture_init failed: %s", esp_err_to_name(err));
         ESP_LOGW(TAG, "Continuing without burst capture");
@@ -830,21 +851,48 @@ void app_main(void)
         bool ok_v_12v = false, ok_v_5v = false, ok_v_3v3 = false;
         bool ok_i_12v = false, ok_i_5v = false, ok_i_3v3 = false;
 
-        if (s_ina226_5vsb != NULL) {
+        /* Capture-phase gating. During CAPTURING (HS window): the 3 main
+         * rails are in fast mode and the HS task owns I2C, so coast on
+         * held EMAs. During DUMPING: the I2C bus is idle - reads, EMAs,
+         * and detectors all run normally; only steady-state TelePlot
+         * emission stays silent because the capture task owns the UART.
+         * Splitting the gate this way recovers ~5 s of monitoring
+         * coverage per burst vs. blanking on any cec_capture_is_busy(). */
+        bool capturing = cec_capture_is_capturing();
+        bool dumping   = cec_capture_is_dumping();
+        if (!capturing && s_ina226_12v) {
+            ok_v_12v = (ina226_read_bus_voltage(s_ina226_12v, &v_12v) == ESP_OK);
+            ok_i_12v = (ina226_read_current(s_ina226_12v, &i_12v) == ESP_OK);
+        }
+        if (!capturing && s_ina226_5v) {
+            ok_v_5v = (ina226_read_bus_voltage(s_ina226_5v, &v_5v) == ESP_OK);
+            ok_i_5v = (ina226_read_current(s_ina226_5v, &i_5v) == ESP_OK);
+        }
+        if (!capturing && s_ina226_3v3) {
+            ok_v_3v3 = (ina226_read_bus_voltage(s_ina226_3v3, &v_3v3) == ESP_OK);
+            ok_i_3v3 = (ina226_read_current(s_ina226_3v3, &i_3v3) == ESP_OK);
+        }
+        if (!capturing && s_ina226_5vsb) {
             ok_5vsb = (ina226_read_bus_voltage(s_ina226_5vsb, &v_5vsb) == ESP_OK &&
                        ina226_read_current(s_ina226_5vsb, &i_5vsb) == ESP_OK);
         }
-        ok_v_12v = (cec_adc_read(&s_rail_12v, &v_12v) == ESP_OK);
-        ok_v_5v  = (cec_adc_read(&s_rail_5v,  &v_5v)  == ESP_OK);
-        ok_v_3v3 = (cec_adc_read(&s_rail_3v3, &v_3v3) == ESP_OK);
-        ok_i_12v = (acs712_read_amps(&s_acs_12v, &i_12v) == ESP_OK);
-        ok_i_5v  = (acs712_read_amps(&s_acs_5v,  &i_5v)  == ESP_OK);
-        ok_i_3v3 = (acs712_read_amps(&s_acs_3v3, &i_3v3) == ESP_OK);
-        ok_temp  = (thermistor_read_celsius(&s_ntc, &temp_c) == ESP_OK);
+        /* NTC temperature arrives with the daughterboard; not wired in v2. */
+        ok_temp = false;
 
-        /* On a failed read, fall back to the last good filtered value so a
-         * single bad sample doesn't ripple into the state classifier. Before
-         * the first successful read an EMA returns 0.0 (its init value). */
+        /* Hold the raw instantaneous value at the last-good EMA on a failed
+         * or skipped read. This keeps the raw-vs-EMA pair consistent so an
+         * I2C glitch can't feed a full-scale deviation into Layer 2 (which
+         * compares instant against EMA). With every rail now on I2C this
+         * matters for all of them, not just the old 5VSB. */
+        if (!ok_v_12v) v_12v = ema_value(&s_v_12v_ema);
+        if (!ok_i_12v) i_12v = ema_value(&s_i_12v_ema);
+        if (!ok_v_5v)  v_5v  = ema_value(&s_v_5v_ema);
+        if (!ok_i_5v)  i_5v  = ema_value(&s_i_5v_ema);
+        if (!ok_v_3v3) v_3v3 = ema_value(&s_v_3v3_ema);
+        if (!ok_i_3v3) i_3v3 = ema_value(&s_i_3v3_ema);
+        if (!ok_5vsb) { v_5vsb = ema_value(&s_v_5vsb_ema); i_5vsb = ema_value(&s_i_5vsb_ema); }
+
+        /* EMA: on a good read advance the filter; otherwise hold last value. */
         float v_5vsb_ema = ok_5vsb  ? ema_update(&s_v_5vsb_ema, v_5vsb) : ema_value(&s_v_5vsb_ema);
         float i_5vsb_ema = ok_5vsb  ? ema_update(&s_i_5vsb_ema, i_5vsb) : ema_value(&s_i_5vsb_ema);
         float v_12v_ema  = ok_v_12v ? ema_update(&s_v_12v_ema,  v_12v)  : ema_value(&s_v_12v_ema);
@@ -854,6 +902,34 @@ void app_main(void)
         float i_5v_ema   = ok_i_5v  ? ema_update(&s_i_5v_ema,   i_5v)   : ema_value(&s_i_5v_ema);
         float i_3v3_ema  = ok_i_3v3 ? ema_update(&s_i_3v3_ema,  i_3v3)  : ema_value(&s_i_3v3_ema);
         float temp_ema   = ok_temp  ? ema_update(&s_temp_ema,   temp_c) : ema_value(&s_temp_ema);
+
+        /* Saturation / stuck-current watchdog. Fed only fresh reads: a
+         * skipped (capturing) or NACK'd sample has ok==false and is passed
+         * over, so the episode freezes instead of advancing on stale held
+         * EMAs or resetting on a transient I²C glitch. */
+        {
+            struct { sat_watch_t *w; bool ok; float i; float imax; const char *name; } sat[] = {
+                { &s_sat_12v,  ok_i_12v, i_12v,  INA226_IMAX_12V,  "12V"  },
+                { &s_sat_5v,   ok_i_5v,  i_5v,   INA226_IMAX_5V,   "5V"   },
+                { &s_sat_3v3,  ok_i_3v3, i_3v3,  INA226_IMAX_3V3,  "3V3"  },
+                { &s_sat_5vsb, ok_5vsb,  i_5vsb, INA226_IMAX_5VSB, "5VSB" },
+            };
+            for (size_t si = 0; si < sizeof(sat) / sizeof(sat[0]); si++) {
+                if (!sat[si].ok) continue;
+                sat_event_t ev = sat_watch_update(sat[si].w, sat[si].i, sat[si].imax);
+                if (ev == SAT_EVT_WARN) {
+                    ESP_LOGW(TAG, "SATURATION on %s: current pinned at %.2f A "
+                                  "(full scale %.2f A) for %.1f s — sustained "
+                                  "over-current or a railed/faulty INA226; "
+                                  "check or replace the module",
+                             sat[si].name, sat[si].i, sat[si].imax,
+                             sat[si].w->count * (SAMPLE_PERIOD_MS / 1000.0f));
+                } else if (ev == SAT_EVT_RECOVERED) {
+                    ESP_LOGI(TAG, "SATURATION on %s cleared (now %.2f A)",
+                             sat[si].name, sat[si].i);
+                }
+            }
+        }
 
         /* Total main-rail power, EMA-smoothed. 5VSB is standby and not
          * included by design (matches v0.5.9). */
@@ -874,7 +950,18 @@ void app_main(void)
          * fast. Fire the burst and assert the mute. The capture path
          * has SHUTDOWN-bypasses-cooldown built in, so this always
          * captures even if a previous burst was recent. */
-        if (rate_valid && !s_shutting_down
+        /* Arm shutdown detection only from a running state (IDLE/ACTIVE/
+         * PEAK). You can't "begin shutting down" from a rail that's
+         * already at/near zero — without this guard, 12V decaying through
+         * the 5..10.5 V band while already in STANDBY re-asserts
+         * s_shutting_down every iteration, and since the mute-clear is a
+         * state-transition edge it never fires (no new edge), leaving the
+         * mute stuck for the whole STANDBY dwell. Gating arming on a
+         * running state kills that re-assert at the source. */
+        bool shutdown_armable = (s_state == CEC_STATE_IDLE
+                                 || s_state == CEC_STATE_ACTIVE
+                                 || s_state == CEC_STATE_PEAK);
+        if (rate_valid && !s_shutting_down && shutdown_armable
             && v_12v_ema > V_12V_SHUTDOWN_MIN_ARMED_V
             && v_12v_rate < V_12V_SHUTDOWN_RATE_THRESHOLD) {
             s_shutting_down = true;
@@ -886,13 +973,18 @@ void app_main(void)
                 ESP_LOGW(TAG, "burst trigger: SHUTDOWN");
             }
         }
-        /* Auto-clear the mute on timeout (e.g. brown-out that recovered
-         * without ever transitioning through STANDBY/OFF). The state-
-         * change clear is handled in the transition block below. */
-        if (s_shutting_down
-            && (esp_timer_get_time() - s_shutdown_start_us) > SHUTDOWN_MUTE_DURATION_US) {
-            s_shutting_down = false;
-            ESP_LOGI(TAG, "shutdown mute window expired");
+        /* Clear the mute on either (a) timeout, or (b) the system having
+         * settled into STANDBY/OFF — checked as a level, not just the
+         * transition edge, so a re-assert mid-STANDBY can't leave it
+         * stuck. Reaching STANDBY/OFF means the shutdown resolved. */
+        if (s_shutting_down) {
+            bool timed_out = (esp_timer_get_time() - s_shutdown_start_us) > SHUTDOWN_MUTE_DURATION_US;
+            bool rails_down = (s_state == CEC_STATE_STANDBY || s_state == CEC_STATE_OFF);
+            if (timed_out || rails_down) {
+                s_shutting_down = false;
+                ESP_LOGI(TAG, "shutdown mute cleared (%s)",
+                         timed_out ? "timeout" : "reached STANDBY/OFF");
+            }
         }
 
         cec_state_t next_state = cec_state_classify(v_12v_ema, v_5vsb_ema, p_total, s_state);
@@ -914,16 +1006,24 @@ void app_main(void)
                 reset_v_12v_history();
                 s_z_above_last = false;
             }
-            /* Landing in OFF or STANDBY means the shutdown sequence
-             * resolved (PSU unplugged → OFF, switched off → STANDBY).
-             * Clear the mute so detectors arm again as soon as the
-             * settle window passes. */
-            if (s_shutting_down
-                && (next_state == CEC_STATE_OFF || next_state == CEC_STATE_STANDBY)) {
-                s_shutting_down = false;
-                ESP_LOGI(TAG, "shutdown mute cleared by transition to %s",
-                         cec_state_name(next_state));
+            /* 5VSB powers up at OFF -> {STANDBY,IDLE+}, not at the main-
+             * rails-up transition. Re-prime its EMA pair so the next
+             * sample jumps from 0 V to the actual ~5 V instead of crawling
+             * up at alpha=0.02 (~1 s tau) for seconds and tripping Layer 1
+             * CRITICAL halfway through. The full reset above already
+             * covers 5VSB on STANDBY -> IDLE, so this only matters for
+             * the OFF -> STANDBY edge but is also harmlessly redundant on
+             * a direct OFF -> IDLE. */
+            if (s_state == CEC_STATE_OFF && next_state != CEC_STATE_OFF) {
+                ema_reset(&s_v_5vsb_ema);
+                ema_reset(&s_i_5vsb_ema);
+                cec_layer1_reset(&s_l1_5vsb);
+                s_last_sev_5vsb = CEC_SEV_NONE;
             }
+            /* (Shutdown-mute clear is handled by the level check above,
+             * which fires whenever s_state is STANDBY/OFF — not just on
+             * this transition edge — so a re-assert mid-STANDBY can't
+             * leave it stuck.) */
             s_state = next_state;
             s_state_entered_us = now_us;
         }
@@ -1107,9 +1207,10 @@ void app_main(void)
 
         /* Periodic NVS save. Only run if profiles got dirty since the
          * last save, and only every NVS_SAVE_INTERVAL_US to limit flash
-         * wear. The 50 Hz loop calls this every iteration; the time
-         * check is the gate. */
-        if (s_profiles_dirty
+         * wear. Never during ANY burst phase: the flash write disables
+         * cache on both cores and would wreck either HS capture timing
+         * (capturing) or UART streaming (dumping). */
+        if (!capturing && !dumping && s_profiles_dirty
             && (esp_timer_get_time() - s_last_nvs_save_us) > NVS_SAVE_INTERVAL_US) {
             esp_err_t err = cec_nvs_save_blob(NVS_PROFILES_KEY, NVS_PROFILES_MAGIC,
                                               s_profiles, sizeof(s_profiles));
@@ -1127,19 +1228,29 @@ void app_main(void)
         }
 
         /* Push a pre-trigger sample every iteration so the ring buffer
-         * always holds the last ~20 s of filtered telemetry. */
-        cec_capture_sample_t pre = {
-            .ts_ms  = (uint32_t)(esp_timer_get_time() / 1000),
-            .state  = (uint8_t)s_state,
-            .v_12v  = v_12v_ema,  .i_12v  = i_12v_ema,
-            .v_5v   = v_5v_ema,   .i_5v   = i_5v_ema,
-            .v_3v3  = v_3v3_ema,  .i_3v3  = i_3v3_ema,
-            .v_5vsb = v_5vsb_ema, .i_5vsb = i_5vsb_ema,
-            .temp_c = temp_ema,
-        };
-        cec_capture_push(&pre);
+         * always holds the last ~20 s of filtered telemetry. Skip during
+         * CAPTURING (EMAs are held/stale, no fresh data) and during
+         * DUMPING (the capture task is reading the ring; we'd overwrite
+         * the captured context). */
+        if (!capturing && !dumping) {
+            cec_capture_sample_t pre = {
+                .ts_ms  = (uint32_t)(esp_timer_get_time() / 1000),
+                .state  = (uint8_t)s_state,
+                .v_12v  = v_12v_ema,  .i_12v  = i_12v_ema,
+                .v_5v   = v_5v_ema,   .i_5v   = i_5v_ema,
+                .v_3v3  = v_3v3_ema,  .i_3v3  = i_3v3_ema,
+                .v_5vsb = v_5vsb_ema, .i_5vsb = i_5vsb_ema,
+                .temp_c = temp_ema,
+            };
+            cec_capture_push(&pre);
+        }
 
-        if (iter % TELEPLOT_DIVIDER == 0) {
+        /* Steady-state TelePlot stays gated on any burst phase. During
+         * CAPTURING the EMAs hold their pre-capture values (sensor reads
+         * were skipped above) — emitting those for 4 s would be flatlined
+         * stale rows that misrepresent freshness. During DUMPING the
+         * capture task owns the UART. */
+        if (!capturing && !dumping && iter % TELEPLOT_DIVIDER == 0) {
             /* Use the device-side millisecond clock for every TelePlot
              * row so the slow-loop output shares a time base with the
              * burst-capture b_*hs_* streams. Without this TelePlot

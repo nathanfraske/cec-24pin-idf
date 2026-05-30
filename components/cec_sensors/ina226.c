@@ -24,18 +24,8 @@ static const char *TAG = "ina226";
 /* Manufacturer ID we expect to read back */
 #define INA226_MFR_ID_EXPECTED 0x5449
 
-/*
- * Configuration register value matches v0.5.9:
- *   AVG = 000 (1 sample averaging)
- *   VBUSCT = 100 (1.1 ms bus conversion time)
- *   VSHCT = 100 (1.1 ms shunt conversion time)
- *   MODE = 111 (continuous shunt + bus)
- * Result: 0x4327
- *
- * Faster sampling possible by lowering VBUSCT/VSHCT to 000 (140 us each)
- * which gives 0x4007. Current value matches v0.5.9 for parity testing.
- */
-#define INA226_CONFIG_VALUE 0x4327
+/* Config-register presets live in ina226.h (INA226_CONFIG_STEADY / _HS);
+ * the value actually written at create time comes from config->config_value. */
 
 /* I2C operation timeout */
 #define INA226_I2C_TIMEOUT_MS 100
@@ -92,8 +82,10 @@ esp_err_t ina226_create(const ina226_config_t *config, ina226_handle_t *out_hand
                         ESP_ERR_INVALID_ARG, TAG, "max_current_a must be positive");
     ESP_RETURN_ON_FALSE(config->voltage_trim > 0.0f,
                         ESP_ERR_INVALID_ARG, TAG, "voltage_trim must be positive");
-    ESP_RETURN_ON_FALSE(config->current_trim > 0.0f,
-                        ESP_ERR_INVALID_ARG, TAG, "current_trim must be positive");
+    /* current_trim may be negative to invert the shunt sign on boards
+     * where IN+/IN- are wired backwards; only zero is invalid. */
+    ESP_RETURN_ON_FALSE(config->current_trim != 0.0f,
+                        ESP_ERR_INVALID_ARG, TAG, "current_trim must be nonzero");
 
     /* Allocate internal struct */
     struct ina226_dev_t *dev = calloc(1, sizeof(struct ina226_dev_t));
@@ -127,8 +119,9 @@ esp_err_t ina226_create(const ina226_config_t *config, ina226_handle_t *out_hand
         goto cleanup;
     }
 
-    /* Write configuration register */
-    err = ina226_write_reg(dev, INA226_REG_CONFIG, INA226_CONFIG_VALUE);
+    /* Write configuration register (caller-supplied; defaults to
+     * INA226_CONFIG_STEADY = 16-sample avg, shunt+bus continuous). */
+    err = ina226_write_reg(dev, INA226_REG_CONFIG, config->config_value);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "CONFIG write failed: %s", esp_err_to_name(err));
         goto cleanup;
@@ -197,6 +190,12 @@ esp_err_t ina226_destroy(ina226_handle_t handle)
     return err;
 }
 
+esp_err_t ina226_set_config(ina226_handle_t handle, uint16_t config_value)
+{
+    ESP_RETURN_ON_FALSE(handle != NULL, ESP_ERR_INVALID_ARG, TAG, "null handle");
+    return ina226_write_reg(handle, INA226_REG_CONFIG, config_value);
+}
+
 esp_err_t ina226_read_bus_voltage(ina226_handle_t handle, float *out_volts)
 {
     ESP_RETURN_ON_FALSE(handle != NULL && out_volts != NULL,
@@ -212,12 +211,16 @@ esp_err_t ina226_read_current(ina226_handle_t handle, float *out_amps)
 {
     ESP_RETURN_ON_FALSE(handle != NULL && out_amps != NULL,
                         ESP_ERR_INVALID_ARG, TAG, "null arg");
+    /* Software path: read the shunt-voltage register directly and divide
+     * by the shunt resistance. Independent of the CAL register, so it
+     * stays correct across config/mode changes (including the HS preset)
+     * and the v2 board's non-standard shunt values. */
     uint16_t raw;
-    esp_err_t err = ina226_read_reg(handle, INA226_REG_CURRENT, &raw);
+    esp_err_t err = ina226_read_reg(handle, INA226_REG_SHUNT_V, &raw);
     if (err != ESP_OK) return err;
-    /* CURRENT register is signed 16-bit, interpret as int16_t */
-    int16_t signed_raw = (int16_t)raw;
-    *out_amps = (float)signed_raw * handle->current_lsb * handle->current_trim;
+    int16_t signed_raw = (int16_t)raw;          /* signed, LSB 2.5 uV */
+    float v_shunt = (float)signed_raw * 2.5e-6f;
+    *out_amps = (v_shunt / handle->shunt_ohms) * handle->current_trim;
     return ESP_OK;
 }
 

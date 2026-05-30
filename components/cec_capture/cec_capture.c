@@ -19,6 +19,16 @@ static const char *TAG = "cec_capture";
 #define HS_BURST_BUF_SIZE      4000
 #define HS_SAMPLE_INTERVAL_US  1000
 
+/* Capture current on every HS sample (1 kHz); capture bus voltage on
+ * every 10th (~100 Hz) — the I2C budget at 400 kHz can't carry all six
+ * INA226 reads every 1 ms, and rail voltage is slow-moving anyway. */
+#define HS_VOLTAGE_DECIMATE    10
+
+/* After switching the sensors to fast mode, wait a couple of conversion
+ * times so the first HS sample reflects the new mode, not a stale
+ * steady-mode value. */
+#define HS_MODE_SETTLE_MS      2
+
 /* Cooldown between bursts. SHUTDOWN bypasses this so a real shutdown
  * sequence can still be captured even if it follows another trigger. */
 #define BURST_COOLDOWN_US      (10LL * 1000 * 1000)
@@ -37,10 +47,17 @@ static volatile int s_pre_write_idx = 0;
 static volatile int s_pre_count = 0;
 
 static cec_capture_hs_sample_fn_t s_hs_fn = NULL;
+static cec_capture_hs_hook_fn_t   s_hs_setup_fn = NULL;
+static cec_capture_hs_hook_fn_t   s_hs_teardown_fn = NULL;
 static SemaphoreHandle_t s_trigger_sem = NULL;
 static TaskHandle_t s_hs_task = NULL;
 
-static volatile bool s_busy = false;
+typedef enum {
+    CAP_IDLE = 0,
+    CAP_CAPTURING,   /* 4 s HS window, capture task hot-polling I2C */
+    CAP_DUMPING,     /* post-capture TelePlot streaming over UART */
+} cec_cap_phase_t;
+static volatile cec_cap_phase_t s_phase = CAP_IDLE;
 static volatile cec_trigger_t s_pending_reason = CEC_TRIG_NONE;
 static volatile int64_t s_last_complete_us = 0;
 static volatile bool s_inited = false;
@@ -76,15 +93,14 @@ void cec_capture_push(const cec_capture_sample_t *s)
     if (s_pre_count < PRE_TRIGGER_BUF_SIZE) s_pre_count++;
 }
 
-bool cec_capture_is_busy(void)
-{
-    return s_busy;
-}
+bool cec_capture_is_busy(void)     { return s_phase != CAP_IDLE; }
+bool cec_capture_is_capturing(void) { return s_phase == CAP_CAPTURING; }
+bool cec_capture_is_dumping(void)   { return s_phase == CAP_DUMPING; }
 
 esp_err_t cec_capture_trigger_with_text(cec_trigger_t reason, const char *text)
 {
-    if (!s_inited) return ESP_ERR_INVALID_STATE;
-    if (s_busy)    return ESP_ERR_NOT_FINISHED;
+    if (!s_inited)           return ESP_ERR_INVALID_STATE;
+    if (s_phase != CAP_IDLE) return ESP_ERR_NOT_FINISHED;
 
     int64_t now = esp_timer_get_time();
     bool bypass_cooldown = (reason == CEC_TRIG_SHUTDOWN);
@@ -93,7 +109,7 @@ esp_err_t cec_capture_trigger_with_text(cec_trigger_t reason, const char *text)
         return ESP_ERR_INVALID_STATE;
     }
 
-    s_busy = true;
+    s_phase = CAP_CAPTURING;
     s_pending_reason = reason;
     if (text != NULL && text[0] != '\0') {
         /* strncpy + explicit NUL — we own the buffer, so we don't care
@@ -161,12 +177,17 @@ static void dump_hs(int64_t hs_start_us)
     for (int i = 0; i < HS_BURST_BUF_SIZE; i++) {
         const cec_capture_hs_sample_t *s = &s_hs_buf[i];
         unsigned ts = (unsigned)(hs_start_ms + (s->ts_us_offset / 1000));
-        teleplot_writef(">hs_v_12v:%u:%.3f\n", ts, s->v_12v);
+        /* Current on every sample (1 kHz). */
         teleplot_writef(">hs_i_12v:%u:%.3f\n", ts, s->i_12v);
-        teleplot_writef(">hs_v_5v:%u:%.3f\n",  ts, s->v_5v);
         teleplot_writef(">hs_i_5v:%u:%.3f\n",  ts, s->i_5v);
-        teleplot_writef(">hs_v_3v3:%u:%.3f\n", ts, s->v_3v3);
         teleplot_writef(">hs_i_3v3:%u:%.3f\n", ts, s->i_3v3);
+        /* Voltage only on the decimated (~100 Hz) samples where it was
+         * actually read; the rest carry no fresh v_* so we don't emit it. */
+        if (i % HS_VOLTAGE_DECIMATE == 0) {
+            teleplot_writef(">hs_v_12v:%u:%.3f\n", ts, s->v_12v);
+            teleplot_writef(">hs_v_5v:%u:%.3f\n",  ts, s->v_5v);
+            teleplot_writef(">hs_v_3v3:%u:%.3f\n", ts, s->v_3v3);
+        }
     }
 }
 
@@ -184,37 +205,60 @@ static void hs_capture_task(void *arg)
         ESP_LOGI(TAG, "burst trigger=%s, capturing %d HS samples at 1 kHz",
                  cec_trigger_name(reason), HS_BURST_BUF_SIZE);
 
+        /* Switch sensors to fast conversion mode for the burst, then let
+         * the first conversions settle before sampling. */
+        if (s_hs_setup_fn != NULL) {
+            s_hs_setup_fn();
+            vTaskDelay(pdMS_TO_TICKS(HS_MODE_SETTLE_MS));
+        }
+
         int64_t hs_start_us = esp_timer_get_time();
         int64_t target_us = hs_start_us;
-        int zero_artifacts = 0;
+        int slots_with_carry = 0;
         for (int i = 0; i < HS_BURST_BUF_SIZE; i++) {
             target_us += HS_SAMPLE_INTERVAL_US;
             spin_until(target_us);
             cec_capture_hs_sample_t *s = &s_hs_buf[i];
             s->ts_us_offset = (uint32_t)(esp_timer_get_time() - hs_start_us);
-            s_hs_fn(s);
+            bool want_voltage = (i % HS_VOLTAGE_DECIMATE == 0);
+            uint32_t ok = s_hs_fn(s, want_voltage);
 
-            /* SAR-ADC glitch mitigation: empirically ~1% of samples come
-             * back with all three voltages at exactly 0.0 even though the
-             * underlying reads returned ESP_OK. Indistinguishable from a
-             * real "all rails off" except by likelihood — for HS capture
-             * the carry-forward is far more useful than the zero dip, and
-             * the trade-off only bites if a burst happens to be running
-             * across a true full-rail collapse (which is rare and will
-             * show as a flat-line in the carry-forward window). */
-            if (i > 0 && s->v_12v == 0.0f && s->v_5v == 0.0f && s->v_3v3 == 0.0f) {
-                const cec_capture_hs_sample_t *prev = &s_hs_buf[i - 1];
-                s->v_12v = prev->v_12v; s->i_12v = prev->i_12v;
-                s->v_5v  = prev->v_5v;  s->i_5v  = prev->i_5v;
-                s->v_3v3 = prev->v_3v3; s->i_3v3 = prev->i_3v3;
-                zero_artifacts++;
+            /* Per-rail carry-forward. The fields the callback was expected
+             * to fill this iteration are CEC_HS_OK_ALL_I always plus
+             * CEC_HS_OK_ALL_V on decimated samples. Any expected field not
+             * marked OK gets the previous sample's value; healthy rails
+             * are untouched, so one device's NACK can no longer void the
+             * other two. */
+            if (i > 0) {
+                uint32_t expected = CEC_HS_OK_ALL_I | (want_voltage ? CEC_HS_OK_ALL_V : 0u);
+                uint32_t missing  = expected & ~ok;
+                if (missing) {
+                    const cec_capture_hs_sample_t *prev = &s_hs_buf[i - 1];
+                    if (missing & CEC_HS_OK_I_12V) s->i_12v = prev->i_12v;
+                    if (missing & CEC_HS_OK_V_12V) s->v_12v = prev->v_12v;
+                    if (missing & CEC_HS_OK_I_5V)  s->i_5v  = prev->i_5v;
+                    if (missing & CEC_HS_OK_V_5V)  s->v_5v  = prev->v_5v;
+                    if (missing & CEC_HS_OK_I_3V3) s->i_3v3 = prev->i_3v3;
+                    if (missing & CEC_HS_OK_V_3V3) s->v_3v3 = prev->v_3v3;
+                    slots_with_carry++;
+                }
             }
         }
         int64_t hs_end_us = esp_timer_get_time();
-        ESP_LOGI(TAG, "HS capture done in %lld us (zero-artifact replacements: %d/%d), "
+
+        /* Restore steady conversion mode. After this returns the I2C bus
+         * is idle until the next iteration of this task — so we drop the
+         * capturing flag and let the main loop resume its own reads even
+         * though the dump is about to take ~5 s over the UART. */
+        if (s_hs_teardown_fn != NULL) {
+            s_hs_teardown_fn();
+        }
+        s_phase = CAP_DUMPING;
+
+        ESP_LOGI(TAG, "HS capture done in %lld us (slots with carry-forward: %d/%d), "
                       "dumping pre+HS to TelePlot",
                  (long long)(hs_end_us - hs_start_us),
-                 zero_artifacts, HS_BURST_BUF_SIZE);
+                 slots_with_carry, HS_BURST_BUF_SIZE);
 
         teleplot_writef(">BURST_BEGIN:%s:%d_normal+%d_hs:%d\n",
                         cec_trigger_name(reason),
@@ -229,17 +273,19 @@ static void hs_capture_task(void *arg)
         teleplot_writef(">BURST_END\n");
 
         s_last_complete_us = esp_timer_get_time();
-        s_busy = false;
+        s_phase = CAP_IDLE;
         ESP_LOGI(TAG, "burst complete");
     }
 }
 
-esp_err_t cec_capture_init(cec_capture_hs_sample_fn_t hs_sample_fn)
+esp_err_t cec_capture_init(const cec_capture_config_t *cfg)
 {
     if (s_inited) return ESP_OK;
-    if (hs_sample_fn == NULL) return ESP_ERR_INVALID_ARG;
+    if (cfg == NULL || cfg->sample_fn == NULL) return ESP_ERR_INVALID_ARG;
 
-    s_hs_fn = hs_sample_fn;
+    s_hs_fn = cfg->sample_fn;
+    s_hs_setup_fn = cfg->setup_fn;
+    s_hs_teardown_fn = cfg->teardown_fn;
     memset(s_pre_buf, 0, sizeof(s_pre_buf));
     s_pre_write_idx = 0;
     s_pre_count = 0;

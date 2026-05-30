@@ -59,7 +59,12 @@ typedef struct {
 } cec_capture_sample_t;
 
 /* HS sample (1 kHz, main rails only). Slim by design so the buffer
- * fits comfortably and per-sample callback runtime stays small. */
+ * fits comfortably and per-sample callback runtime stays small.
+ *
+ * v2: current (i_*) is captured on every sample at 1 kHz; bus voltage
+ * (v_*) is captured only on every HS_VOLTAGE_DECIMATE-th sample (~100 Hz),
+ * since at 400 kHz the I2C budget can't carry 6 INA226 reads every 1 ms.
+ * Voltage at the PSU-side Kelvin tap is stiff, so 100 Hz is plenty. */
 typedef struct {
     uint32_t ts_us_offset;   /* microseconds since HS capture start */
     float    v_12v, i_12v;
@@ -67,19 +72,50 @@ typedef struct {
     float    v_3v3, i_3v3;
 } cec_capture_hs_sample_t;
 
-/* Callback the capture engine calls at 1 kHz during the HS window.
- * Must complete well within the 1 ms budget. Runs on the HS task
- * (Core 1 by default) so it can safely call cec_adc_read_mv et al. */
-typedef void (*cec_capture_hs_sample_fn_t)(cec_capture_hs_sample_t *out);
+/* Per-rail success bits returned by cec_capture_hs_sample_fn_t. The
+ * engine carries the previous sample's value forward on any rail whose
+ * bit is clear, so one bad device can't void healthy ones. On
+ * want_voltage=false samples the V_* bits are simply absent (not
+ * failures, just not requested); their carry-forward is harmless since
+ * dump_hs only emits hs_v_* on decimated samples. */
+#define CEC_HS_OK_I_12V  (1u << 0)
+#define CEC_HS_OK_V_12V  (1u << 1)
+#define CEC_HS_OK_I_5V   (1u << 2)
+#define CEC_HS_OK_V_5V   (1u << 3)
+#define CEC_HS_OK_I_3V3  (1u << 4)
+#define CEC_HS_OK_V_3V3  (1u << 5)
+#define CEC_HS_OK_ALL_I  (CEC_HS_OK_I_12V | CEC_HS_OK_I_5V | CEC_HS_OK_I_3V3)
+#define CEC_HS_OK_ALL_V  (CEC_HS_OK_V_12V | CEC_HS_OK_V_5V | CEC_HS_OK_V_3V3)
+
+/* Per-sample HS callback, invoked at 1 kHz on the capture task. Must
+ * complete well within the 1 ms budget. `want_voltage` is true on the
+ * decimated (~100 Hz) samples where the caller should also read bus
+ * voltage. Returns a bitmask of which fields were successfully read;
+ * unset bits get carried forward from the previous sample by the
+ * engine, so one rail's NACK doesn't discard the others. */
+typedef uint32_t (*cec_capture_hs_sample_fn_t)(cec_capture_hs_sample_t *out, bool want_voltage);
+
+/* Optional hooks run once on the capture task immediately before and
+ * after the 1 kHz HS loop. Used to switch the sensors into a fast
+ * conversion mode for the burst and restore the steady mode after.
+ * Either may be NULL. */
+typedef void (*cec_capture_hs_hook_fn_t)(void);
+
+typedef struct {
+    cec_capture_hs_sample_fn_t sample_fn;    /* required */
+    cec_capture_hs_hook_fn_t   setup_fn;     /* optional: pre-HS (e.g. fast mode) */
+    cec_capture_hs_hook_fn_t   teardown_fn;  /* optional: post-HS (e.g. restore) */
+} cec_capture_config_t;
 
 /* Human-readable trigger name for log/teleplot output. */
 const char *cec_trigger_name(cec_trigger_t t);
 
 /*
  * Initialize the engine. Creates the HS capture task pinned to Core 1,
- * registers the sample callback, zeroes the pre-trigger ring. Idempotent.
+ * registers the callbacks, zeroes the pre-trigger ring. Idempotent.
+ * cfg and cfg->sample_fn must be non-NULL.
  */
-esp_err_t cec_capture_init(cec_capture_hs_sample_fn_t hs_sample_fn);
+esp_err_t cec_capture_init(const cec_capture_config_t *cfg);
 
 /*
  * Push a sample into the pre-trigger ring. Called from the main loop
@@ -111,9 +147,28 @@ esp_err_t cec_capture_trigger_with_text(cec_trigger_t reason, const char *text);
 
 /*
  * True between the moment a trigger is accepted and the moment the
- * dump completes.
+ * dump completes (i.e. capturing OR dumping). Use this gate for things
+ * a burst should never coincide with regardless of phase (flash writes,
+ * trigger re-arming).
  */
 bool cec_capture_is_busy(void);
+
+/*
+ * True only during the 1 kHz HS capture window — when the capture task
+ * is hot-polling I2C in fast mode. Use this to gate the main loop's own
+ * I2C reads (avoid bus contention) and the pre-trigger ring push (no
+ * fresh data is being acquired then).
+ */
+bool cec_capture_is_capturing(void);
+
+/*
+ * True only during the post-capture TelePlot dump — when the capture
+ * task owns the TelePlot UART. Use this to gate steady-state TelePlot
+ * emission from the main loop (avoid injecting stray rows into the
+ * >BURST_BEGIN ... >BURST_END envelope). Sensor reads and detector
+ * runs are SAFE during this phase — the I2C bus is idle.
+ */
+bool cec_capture_is_dumping(void);
 
 #ifdef __cplusplus
 }

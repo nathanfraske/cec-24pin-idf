@@ -14,7 +14,7 @@
  *   cec_adc_init();
  *   cec_adc_setup_channel(ADC_CH_V_12V);
  *   cec_adc_setup_channel(ADC_CH_V_5V);
- *   ... (one call per channel; thermistor / acs712 drivers register theirs)
+ *   ... (one call per channel; e.g. the thermistor driver registers its own)
  *   cec_adc_start();
  *
  * After cec_adc_start the pattern is locked; further setup_channel calls

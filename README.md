@@ -22,7 +22,7 @@ cec-24pin-idf/
     ├── cec_common/             Shared enums (cec_state_t, cec_severity_t)
     ├── cec_filters/            EMA + rolling-median primitives
     ├── cec_nvs/                Thin NVS save/load/clear blob wrapper
-    ├── cec_sensors/            Hardware abstractions: INA226, ACS712, NTC, ADC1
+    ├── cec_sensors/            INA226 (active); cec_adc + thermistor (dormant, NTC)
     ├── cec_detection/          State classifier, Layer 1/2/3, swing detectors
     ├── cec_capture/            Burst capture engine, pre-trigger ring
     ├── cec_telemetry/          TelePlot output helpers
@@ -57,27 +57,24 @@ Tracking the port progress from Arduino-ESP32 v0.5.9 to ESP-IDF:
 |---|---|
 | Project skeleton | Done |
 | Hello World boot | Done (validated on prototype hardware) |
-| I2C master driver (for INA226) | Done |
-| ADC oneshot reads — rail voltages (12V/5V/3V3) | Done |
-| ADC oneshot reads — NTC temperature | Done |
-| ADC oneshot reads — rail currents (i_12V/i_5V/i_3V3 via ACS712) | Done (zero-point cal pending) |
-| ADC continuous mode (DMA) | Done |
-| Sample loop at 50 Hz | Done |
+| I2C master driver | Done |
+| Detection stack (state classifier, Layers 1/2/3, swings, shutdown mute, saturation watchdog) | Done |
 | EMA / median filter primitives | Done |
-| Teleplot output via USB CDC | Done |
-| State classifier | Done |
-| Layer 1 static thresholds | Done |
-| Layer 2 (adaptive transient) | Done |
-| Layer 3 (Z-score anomaly) | Done |
-| Power-swing detector | Done |
-| Current-swing detector | Done |
-| Burst capture engine | Done (non-blocking; HS reads the continuous-mode cache) |
+| Sample loop at 50 Hz | Done |
+| Teleplot output (dual-stream UART) | Done |
+| Burst capture engine | Done (non-blocking, 1 kHz HS; phase-split gating preserves detection during dump) |
 | NVS profile storage | Done |
-| Serial command interface | Done (burst / set / status; ACS712 cal deferred — moving to INA226s) |
-| Shutdown detection + mute window | Done |
+| Serial command interface | Done (burst / set / status) |
 
-Deferred work — EPS-parity items, a code-review cleanup (lint) list, and the
-hardware-driven INA226 swap — is tracked in [FOLLOWUPS.md](FOLLOWUPS.md).
+The v0.5.9 → ESP-IDF port is complete; the firmware tracks the prototype board revisions below.
+
+## Hardware revisions
+
+**v2 (current):** all four rails sensed by INA226 over I2C0 — `0x40` +12V (0.002 Ω), `0x41` +5V (0.002 Ω), `0x44` +3.3V (0.025 Ω), `0x45` +5VSB (0.025 Ω). The 5V rail was re-shunted from 0.010 Ω to 0.002 Ω after the test PC's ~20 A 5V draw saturated the 8.19 A range and overheated the smaller shunt; 0.002 Ω gives a 40.96 A range at ~0.8 W. Current is computed in software (shunt µV / R_shunt). The v1 ADC voltage-divider taps and ACS712 current sensors are removed. The 1 kHz HS burst reconfigures the three main-rail INA226s to fast mode (~140 µs conversions) and captures current at 1 kHz with voltage decimated to ~100 Hz. A per-rail saturation watchdog flags any rail whose current pins at the INA226 full-scale ceiling (±81.92 mV / R_shunt) and holds flat — the signature of a railed/faulty sense front end or a sustained over-current, rather than a real reading.
+
+**Pending the shared daughterboard** (`[PENDING]` in the v2 spec): NTC thermistor on ADC1_CH6 (GPIO7) — `cec_adc`/`thermistor` stay in the build, ADC subsystem uninitialized until wired; and CAN/TWAI (TX GPIO4, RX moved GPIO5→GPIO15) — no `cec_comms` component in this repo yet.
+
+Deferred work — EPS-parity items, a code-review cleanup list, and the daughterboard NTC/CAN bring-up — is tracked in [FOLLOWUPS.md](FOLLOWUPS.md).
 
 ## Behavior parity check
 
